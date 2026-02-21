@@ -1,6 +1,7 @@
 #ifndef ZYGISKFRIDA_SOLIST_PATCH_H
 #define ZYGISKFRIDA_SOLIST_PATCH_H
 
+#include <stdint.h>
 #include <stdbool.h>
 
 #ifdef __cplusplus

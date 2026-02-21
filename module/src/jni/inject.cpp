@@ -239,3 +239,9 @@ bool check_and_inject(std::string const &app_name) {
 
     return true;
 }
+
+void check_and_inject_with_config(target_config const &cfg) {
+    LOGI("PID: %d", getpid());
+    std::thread inject_thread(inject_libs, cfg);
+    inject_thread.detach();
+}

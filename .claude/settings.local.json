@@ -4,7 +4,13 @@
       "Read(//e/MyTool/AndKittyInjector/**)",
       "Read(//e/MyTool/frida/subprojects/frida-core/lib/gadget/**)",
       "Read(//e/MyTool/frida/subprojects/frida-core/**)",
-      "Read(//e/MyTool/frida/subprojects/frida-gum/**)"
+      "Read(//e/MyTool/frida/subprojects/frida-gum/**)",
+      "Read(//c/Users/27462/.gradle/wrapper/dists/gradle-7.5-bin/f1w0cc9nuo0eivz97x2xlu9sv/**)",
+      "Read(//c/Users/27462/.gradle/wrapper/dists/**)",
+      "Bash(java:*)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\27462\\.gradle\\wrapper\\dists\\gradle-7.5-bin\\f1w0cc9nuo0eivz97x2xlu9sv"
     ]
   }
 }

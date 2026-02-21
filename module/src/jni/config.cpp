@@ -254,3 +254,40 @@ std::optional<target_config> load_config(std::string const &module_dir, std::str
 
     return load_simple_config(module_dir, app_name);
 }
+
+std::optional<target_config> parse_advanced_config(std::string const &config, std::string const &app_name) {
+    rapidjson::Document doc;
+    doc.Parse(config.c_str(), config.size());
+
+    if (doc.HasParseError()) {
+        LOGE("companion config parse error offset %u: %s",
+             (unsigned) doc.GetErrorOffset(),
+             GetParseError_En(doc.GetParseError()));
+        return std::nullopt;
+    }
+
+    if (!doc.IsObject()) {
+        LOGE("companion config expected a json root object");
+        return std::nullopt;
+    }
+
+    auto &targets = doc["targets"];
+    if (!targets.IsArray()) {
+        LOGE("companion config expected targets to be an array");
+        return std::nullopt;
+    }
+
+    for (rapidjson::SizeType i = 0; i < targets.Size(); i++) {
+        auto deserialized_target = deserialize_target_config(targets[i]);
+        if (!deserialized_target.has_value()) {
+            return std::nullopt;
+        }
+
+        auto target = deserialized_target.value();
+        if (target.app_name == app_name) {
+            return target;
+        }
+    }
+
+    return std::nullopt;
+}
