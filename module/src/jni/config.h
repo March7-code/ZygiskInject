@@ -18,6 +18,9 @@ struct target_config{
     uint64_t start_up_delay_ms;
     std::vector<std::string> injected_libraries;
     child_gating_config child_gating;
+    // Thread name used to disguise frida threads. Must be <= 15 chars.
+    // Defaults to "pool-1-thread-1" if not set in config.
+    std::string thread_disguise_name;
 };
 
 std::optional<target_config> load_config(std::string const& module_dir, std::string const& app_name);

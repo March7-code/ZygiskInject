@@ -117,6 +117,20 @@ static std::optional<target_config> deserialize_target_config(const rapidjson::V
         result.child_gating = child_gating.value();
     }
 
+    if (doc.HasMember("thread_disguise_name")) {
+        auto &tdn = doc["thread_disguise_name"];
+        if (!tdn.IsString()) {
+            LOGE("invalid config: thread_disguise_name must be a string");
+            return std::nullopt;
+        }
+        std::string name = tdn.GetString();
+        if (name.size() > 15) {
+            LOGE("invalid config: thread_disguise_name exceeds 15 chars (TASK_COMM_LEN-1)");
+            return std::nullopt;
+        }
+        result.thread_disguise_name = name;
+    }
+
     return result;
 }
 

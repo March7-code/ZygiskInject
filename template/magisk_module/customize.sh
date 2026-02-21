@@ -3,7 +3,7 @@ SKIPUNZIP=1
 FLAVOR=@FLAVOR@
 MODULE_ID=@MODULE_ID@
 
-TMP_MODULE_DIR=/data/local/tmp/re.zyg.fri
+TMP_MODULE_DIR=/data/adb/re.zyg.fri
 
 if [ "$FLAVOR" != "zygisk" ] && [ "$FLAVOR" != "riru" ]; then
   abort "! Unknown ZygiskFrida flavor: $FLAVOR"

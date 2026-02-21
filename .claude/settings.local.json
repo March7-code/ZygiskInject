@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Read(//e/MyTool/AndKittyInjector/**)"
+      "Read(//e/MyTool/AndKittyInjector/**)",
+      "Read(//e/MyTool/frida/subprojects/frida-core/lib/gadget/**)",
+      "Read(//e/MyTool/frida/subprojects/frida-core/**)",
+      "Read(//e/MyTool/frida/subprojects/frida-gum/**)"
     ]
   }
 }
