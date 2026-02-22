@@ -22,6 +22,10 @@
 #include "remapper.h"
 #include "solist_patch.h"
 
+#if defined(__aarch64__)
+#include "tracer/tracer_main.h"
+#endif
+
 static std::string get_process_name() {
     auto path = "/proc/self/cmdline";
 

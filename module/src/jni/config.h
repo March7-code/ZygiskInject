@@ -33,6 +33,12 @@ struct target_config{
     std::string gadget_connect_address = "127.0.0.1";
     uint16_t gadget_connect_port = 27052;
     std::string gadget_on_load = "resume";
+
+    // Anti-cheat detection tracer settings.
+    // tracer_mode: "off" (default), "probe" (log only), "block" (phase-2 hook).
+    // tracer_log_path: log file for probe mode.
+    std::string tracer_mode = "off";
+    std::string tracer_log_path = "/data/local/tmp/re.zyg.fri/syscall_trace.log";
 };
 
 std::optional<target_config> load_config(std::string const& module_dir, std::string const& app_name);

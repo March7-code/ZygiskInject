@@ -166,6 +166,21 @@ static std::optional<target_config> deserialize_target_config(const rapidjson::V
         }
     }
 
+    // Tracer (anti-cheat detection) settings
+    if (doc.HasMember("tracer_mode")) {
+        auto &v = doc["tracer_mode"];
+        if (v.IsString()) {
+            result.tracer_mode = v.GetString();
+        }
+    }
+
+    if (doc.HasMember("tracer_log_path")) {
+        auto &v = doc["tracer_log_path"];
+        if (v.IsString()) {
+            result.tracer_log_path = v.GetString();
+        }
+    }
+
     return result;
 }
 

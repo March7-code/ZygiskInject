@@ -13,6 +13,10 @@
 #include "log.h"
 #include "zygisk.h"
 
+#if defined(__aarch64__)
+#include "tracer/tracer_main.h"
+#endif
+
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 using zygisk::ServerSpecializeArgs;
@@ -161,6 +165,24 @@ static void companion_handler(int client) {
         write_string(client, tmp_path);  // empty on failure
     }
 
+    // Step 3: tracer launch request (arm64 only)
+    // Protocol: recv tracer_mode string
+    //   if "probe" -> recv target_pid (uint32), recv log_path -> launch tracer
+    //   otherwise  -> no-op
+#if defined(__aarch64__)
+    std::string tracer_mode;
+    if (read_string(client, tracer_mode) && tracer_mode == "probe") {
+        uint32_t target_pid = 0;
+        if (read(client, &target_pid, sizeof(target_pid)) == sizeof(target_pid)) {
+            std::string log_path;
+            read_string(client, log_path);
+            LOGI("[companion] launching tracer for pid %u, log=%s",
+                 target_pid, log_path.c_str());
+            launch_tracer((pid_t)target_pid, log_path);
+        }
+    }
+#endif
+
 }
 
 REGISTER_ZYGISK_COMPANION(companion_handler)
@@ -226,6 +248,23 @@ class MyModule : public zygisk::ModuleBase {
 
         // Send empty sentinel to end lib copy session
         write_string(sock, "");
+
+        // Step 3: request tracer launch if configured (arm64 only)
+        // The companion (root) will fork a tracer process that attaches
+        // to our pid via ptrace. We send the request here in preAppSpecialize
+        // because connectCompanion is only available at this stage.
+#if defined(__aarch64__)
+        if (cfg->tracer_mode == "probe") {
+            write_string(sock, "probe");
+            uint32_t my_pid = (uint32_t)getpid();
+            ::write(sock, &my_pid, sizeof(my_pid));
+            write_string(sock, cfg->tracer_log_path);
+        } else {
+            write_string(sock, "off");
+        }
+#else
+        write_string(sock, "off");
+#endif
 
         close(sock);
     }
