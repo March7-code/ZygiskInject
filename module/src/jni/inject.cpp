@@ -1,19 +1,19 @@
 #include "inject.h"
 
-#include <dobby.h>
-#include <pthread.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
-#include <atomic>
 #include <chrono>
 #include <cinttypes>
-#include <filesystem>
+#include <cstring>
 #include <fstream>
-#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
-#include <utility>
+#include <vector>
 
 #include "config.h"
 #include "log.h"
@@ -69,133 +69,184 @@ static void delay_start_up(uint64_t start_up_delay_ms) {
     }
 }
 
-// Thread names created by frida-gadget on Android/Linux (verified from source):
-//   gadget-glue.c:111        -> "frida-gadget"    (gadget worker loop)
-//   frida-glue.c:47          -> "frida-main-loop"  (frida-core main loop)
-//   gumscriptscheduler.c:117 -> "gum-js-loop"      (JS engine thread)
-// Matched as prefix so "frida-gadget" also catches any future "frida-gadget-N".
-//
-// GLib internals ("gmain", "gdbus") are intentionally excluded to avoid
-// accidentally renaming threads from apps that use GLib themselves.
-static const char *const FRIDA_THREAD_NAMES[] = {
-    "frida-gadget",
-    "frida-main-loop",
-    "gum-js-loop",
-    // "gmain",   // excluded: may collide with app's own GLib threads
-    // "gdbus",   // excluded: may collide with app's own GLib threads
-    nullptr
-};
+// ---------------------------------------------------------------------------
+// /proc/net/tcp filtering — hide frida gadget's outgoing connection
+// ---------------------------------------------------------------------------
+// When gadget uses connect mode, the ESTABLISHED connection shows up in
+// /proc/net/tcp (or tcp6).  Detection code reads these files to find
+// suspicious ports.  We hook open/openat to return a filtered fd.
 
-// Replacement name used for all matched threads. Must be <= 15 chars.
-// Defaults to "pool-1-thread-1"; overridden per-target via config.
-static std::string g_thread_disguise_name = "pool-1-thread-1";
+static std::vector<uint16_t> g_hide_ports;  // host byte order ports to hide
 
-static bool is_frida_thread_name(const char *name) {
-    for (int i = 0; FRIDA_THREAD_NAMES[i] != nullptr; i++) {
-        if (strncmp(name, FRIDA_THREAD_NAMES[i], strlen(FRIDA_THREAD_NAMES[i])) == 0) {
-            return true;
-        }
-    }
-    return false;
+static int (*real_open)(const char *, int, ...) = nullptr;
+static int (*real_openat)(int, const char *, int, ...) = nullptr;
+
+// Check if a path is /proc/net/tcp or /proc/net/tcp6
+static bool is_proc_net_tcp(const char *path) {
+    if (!path) return false;
+    return strcmp(path, "/proc/net/tcp") == 0 ||
+           strcmp(path, "/proc/net/tcp6") == 0 ||
+           strcmp(path, "/proc/self/net/tcp") == 0 ||
+           strcmp(path, "/proc/self/net/tcp6") == 0;
 }
 
-// Hook state for pthread_setname_np interception.
-// The hook is installed just before dlopen and removed once all frida threads
-// have been renamed (tracked by a counter that decrements to zero).
-static int (*orig_pthread_setname_np)(pthread_t, const char *) = nullptr;
+// Build a filtered copy of /proc/net/tcp that omits lines containing any
+// hidden port.  Ports appear as hex in columns 2 (local) and 3 (remote).
+static int make_filtered_tcp_fd(const char *real_path) {
+    // Read the real file via raw syscall to bypass our own hook
+    int src = syscall(__NR_openat, AT_FDCWD, real_path, O_RDONLY | O_CLOEXEC);
+    if (src < 0) return -1;
 
-// Number of frida thread names we still expect to see.  When it reaches 0 the
-// hook removes itself.  Initialised to the number of non-null entries in
-// FRIDA_THREAD_NAMES each time install_thread_rename_hook() is called.
-static std::atomic<int> g_remaining_renames{0};
-
-static int my_pthread_setname_np(pthread_t thread, const char *name) {
-    if (name && is_frida_thread_name(name)) {
-        const char *disguise = g_thread_disguise_name.c_str();
-        LOGI("[thread_rename] intercepted '%s' -> '%s'", name, disguise);
-        int ret = orig_pthread_setname_np(thread, disguise);
-
-        // Unhook once all expected frida threads have been renamed.
-        if (--g_remaining_renames <= 0) {
-            DobbyDestroy(reinterpret_cast<void *>(orig_pthread_setname_np));
-            orig_pthread_setname_np = nullptr;
-            LOGI("[thread_rename] all frida threads renamed, hook removed");
-        }
-        return ret;
+    std::string content;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(src, buf, sizeof(buf))) > 0) {
+        content.append(buf, n);
     }
-    return orig_pthread_setname_np(thread, name);
+    close(src);
+
+    // Build hex needles for all hidden ports
+    std::vector<std::string> needles;
+    for (uint16_t port : g_hide_ports) {
+        char hex[8];
+        snprintf(hex, sizeof(hex), ":%04X", port);
+        needles.emplace_back(hex);
+    }
+
+    // Filter line by line
+    std::string filtered;
+    std::istringstream stream(content);
+    std::string line;
+    bool first_line = true;
+    while (std::getline(stream, line)) {
+        if (first_line) {
+            filtered += line + "\n";
+            first_line = false;
+            continue;
+        }
+        bool hide = false;
+        for (auto &needle : needles) {
+            if (line.find(needle) != std::string::npos) {
+                hide = true;
+                break;
+            }
+        }
+        if (hide) continue;
+        filtered += line + "\n";
+    }
+
+    // Create an in-memory fd via memfd_create (API 26+) or a pipe
+    int memfd = syscall(__NR_memfd_create, "tcp", 0);
+    if (memfd < 0) {
+        int pipefd[2];
+        if (pipe(pipefd) < 0) return -1;
+        write(pipefd[1], filtered.data(), filtered.size());
+        close(pipefd[1]);
+        return pipefd[0];
+    }
+
+    write(memfd, filtered.data(), filtered.size());
+    lseek(memfd, 0, SEEK_SET);
+    return memfd;
 }
 
-static void install_thread_rename_hook() {
-    // Count how many thread names we expect to intercept.
-    int count = 0;
-    for (int i = 0; FRIDA_THREAD_NAMES[i] != nullptr; i++) count++;
-    g_remaining_renames.store(count);
-
-    void *sym = dlsym(RTLD_DEFAULT, "pthread_setname_np");
-    if (!sym) {
-        LOGW("[thread_rename] pthread_setname_np not found, skipping hook");
-        return;
+static int hook_openat(int dirfd, const char *pathname, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
     }
 
-    int rc = DobbyHook(sym,
-                       reinterpret_cast<void *>(my_pthread_setname_np),
-                       reinterpret_cast<void **>(&orig_pthread_setname_np));
-    if (rc != 0) {
-        LOGW("[thread_rename] DobbyHook failed (%d), skipping", rc);
-        orig_pthread_setname_np = nullptr;
-    } else {
-        LOGI("[thread_rename] pthread_setname_np hook installed");
+    if (!g_hide_ports.empty() && is_proc_net_tcp(pathname)) {
+        int fd = make_filtered_tcp_fd(pathname);
+        if (fd >= 0) return fd;
     }
+
+    return real_openat(dirfd, pathname, flags, mode);
+}
+
+static int hook_open(const char *pathname, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
+
+    if (!g_hide_ports.empty() && is_proc_net_tcp(pathname)) {
+        int fd = make_filtered_tcp_fd(pathname);
+        if (fd >= 0) return fd;
+    }
+
+    return real_open(pathname, flags, mode);
 }
 
 void inject_lib(std::string const &lib_path, std::string const &logContext) {
-    // Install the pthread_setname_np hook before dlopen so we intercept frida's
-    // thread names at the exact moment they are set, with no polling window.
-    install_thread_rename_hook();
+    bool is_tmp = lib_path.find("/.zyg_") != std::string::npos;
+
+    auto cleanup_tmp = [&]() {
+        if (!is_tmp) return;
+        unlink(lib_path.c_str());
+        std::string cfg_path = lib_path.substr(0, lib_path.size() - 3) + ".config.so";
+        unlink(cfg_path.c_str());
+    };
 
     auto *handle = xdl_open(lib_path.c_str(), XDL_TRY_FORCE_LOAD);
     if (handle) {
         LOGI("%sInjected %s with handle %p", logContext.c_str(), lib_path.c_str(), handle);
-        remap_lib(lib_path);
+        cleanup_tmp();
+
         xdl_info_t info{};
         void *cache = nullptr;
         if (xdl_info(handle, XDL_DI_DLINFO, &info) == 0 && info.dli_fbase) {
             solist_remove_lib((uintptr_t)info.dli_fbase);
         } else {
-            LOGW("%sFailed to get load address for solist removal: %s", logContext.c_str(), lib_path.c_str());
+            LOGW("%sFailed to get load address: %s", logContext.c_str(), lib_path.c_str());
         }
         xdl_addr_clean(&cache);
+
+        remap_lib(lib_path);
         return;
     }
 
     auto xdl_err = dlerror();
 
-    handle = dlopen(lib_path.c_str(), RTLD_NOW);
-    if (handle) {
-        LOGI("%sInjected %s with handle %p (dlopen)", logContext.c_str(), lib_path.c_str(), handle);
-        remap_lib(lib_path);
+    void *dl_handle = dlopen(lib_path.c_str(), RTLD_NOW);
+    if (dl_handle) {
+        LOGI("%sInjected %s with handle %p (dlopen)", logContext.c_str(), lib_path.c_str(), dl_handle);
+        cleanup_tmp();
+
         Dl_info dl_info{};
-        if (dladdr(handle, &dl_info) && dl_info.dli_fbase) {
+        if (dladdr(dl_handle, &dl_info) && dl_info.dli_fbase) {
             solist_remove_lib((uintptr_t)dl_info.dli_fbase);
         } else {
-            LOGW("%sFailed to get load address for solist removal: %s", logContext.c_str(), lib_path.c_str());
+            LOGW("%sFailed to get load address: %s", logContext.c_str(), lib_path.c_str());
         }
+
+        remap_lib(lib_path);
         return;
     }
 
-    // Both injection methods failed; remove the hook we installed.
-    if (orig_pthread_setname_np) {
-        DobbyDestroy(reinterpret_cast<void *>(orig_pthread_setname_np));
-        orig_pthread_setname_np = nullptr;
-    }
-
+    cleanup_tmp();
     auto dl_err = dlerror();
     LOGE("%sFailed to inject %s (xdl_open): %s", logContext.c_str(), lib_path.c_str(), xdl_err);
     LOGE("%sFailed to inject %s (dlopen): %s", logContext.c_str(), lib_path.c_str(), dl_err);
 }
 
 static void inject_libs(target_config const &cfg) {
+    // Set up /proc/net/tcp filtering — auto-derive port from interaction mode.
+    if (cfg.gadget_interaction == "connect" && cfg.gadget_connect_port > 0) {
+        g_hide_ports.push_back(cfg.gadget_connect_port);
+    } else {
+        // listen mode: hide the listen port (default 27042)
+        uint16_t lport = cfg.gadget_listen_port > 0 ? cfg.gadget_listen_port : 27042;
+        g_hide_ports.push_back(lport);
+    }
+    LOGI("[net_filter] hiding port %d from /proc/net/tcp", g_hide_ports[0]);
+
     wait_for_init(cfg.app_name);
 
     if (cfg.child_gating.enabled) {
@@ -203,12 +254,6 @@ static void inject_libs(target_config const &cfg) {
     }
 
     delay_start_up(cfg.start_up_delay_ms);
-
-    // Apply per-target thread disguise name if configured.
-    if (!cfg.thread_disguise_name.empty()) {
-        g_thread_disguise_name = cfg.thread_disguise_name;
-        LOGI("Thread disguise name set to '%s'", g_thread_disguise_name.c_str());
-    }
 
     for (auto &lib_path : cfg.injected_libraries) {
         LOGI("Injecting %s", lib_path.c_str());

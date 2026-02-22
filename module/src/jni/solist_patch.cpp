@@ -2,11 +2,14 @@
 
 #include <dlfcn.h>
 #include <elf.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <link.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "log.h"
 #include "xdl.h"
@@ -35,8 +38,22 @@ static inline uintptr_t si_read_ptr(uintptr_t si, size_t off) {
 }
 
 // Write a pointer-sized value at byte offset `off` inside the soinfo at `si`.
-static inline void si_write_ptr(uintptr_t si, size_t off, uintptr_t val) {
-    *(uintptr_t *)(si + off) = val;
+// The linker may mprotect soinfo pages as read-only, so we temporarily make
+// the target page writable before writing.
+static inline bool si_write_ptr(uintptr_t si, size_t off, uintptr_t val) {
+    uintptr_t addr = si + off;
+    uintptr_t page = addr & ~(uintptr_t)(getpagesize() - 1);
+    size_t page_size = (size_t)getpagesize();
+
+    if (mprotect((void *)page, page_size, PROT_READ | PROT_WRITE) != 0) {
+        LOGW("[solist_patch] mprotect RW failed for %p: %s", (void *)page, strerror(errno));
+        return false;
+    }
+
+    *(uintptr_t *)addr = val;
+
+    mprotect((void *)page, page_size, PROT_READ);
+    return true;
 }
 
 // Probe the soinfo struct pointed to by `si` to find the byte offsets of the
@@ -85,7 +102,16 @@ static bool find_soinfo_offsets(uintptr_t si,
             ElfW(Dyn) *dyn = (ElfW(Dyn) *)(base_val + phdr[p].p_vaddr);
             for (; dyn->d_tag != DT_NULL; dyn++) {
                 if (dyn->d_tag == DT_STRTAB) {
-                    strtab_val = base_val + dyn->d_un.d_ptr;
+                    uintptr_t raw = (uintptr_t)dyn->d_un.d_ptr;
+                    // d_ptr may be an absolute address (already relocated by
+                    // the linker) or a relative offset from the ELF base.
+                    // Heuristic: if it's already larger than base_val it's
+                    // absolute; otherwise treat it as a relative offset.
+                    if (raw >= base_val) {
+                        strtab_val = raw;
+                    } else {
+                        strtab_val = base_val + raw;
+                    }
                     break;
                 }
             }
@@ -188,15 +214,23 @@ bool solist_remove_lib(uintptr_t load_address) {
 
     // Unlink: prev->next = curr->next
     if (prev == 0) {
-        // Removing the head node
-        *solist_ptr = next;
+        // Removing the head node — write to the linker's solist global
+        if (!si_write_ptr((uintptr_t)solist_ptr, 0, next)) {
+            LOGE("[solist_patch] failed to update solist head pointer");
+            return false;
+        }
     } else {
-        si_write_ptr(prev, next_off, next);
+        if (!si_write_ptr(prev, next_off, next)) {
+            LOGE("[solist_patch] failed to unlink soinfo at %p", (void *)curr);
+            return false;
+        }
     }
 
     // If we removed the tail, update sonext to point to prev.
     if (curr == sonext_val) {
-        *sonext_ptr = prev;
+        if (!si_write_ptr((uintptr_t)sonext_ptr, 0, prev)) {
+            LOGW("[solist_patch] failed to update sonext pointer");
+        }
     }
 
     LOGI("[solist_patch] removed soinfo for 0x%" PRIxPTR " from solist", load_address);

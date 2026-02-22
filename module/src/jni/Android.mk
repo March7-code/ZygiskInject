@@ -8,7 +8,7 @@ APP_STL=none
 LOCAL_MODULE := zygiskfrida
 LOCAL_C_INCLUDES := $(LOCAL_PATH)/xdl/include $(LOCAL_PATH)/include
 LOCAL_SRC_FILES := inject.cpp config.cpp riru_config.cpp child_gating.cpp remapper.cpp solist_patch.cpp $(XDL_FILES:$(LOCAL_PATH)/%=%)
-LOCAL_STATIC_LIBRARIES := cxx dobby
+LOCAL_STATIC_LIBRARIES := cxx
 LOCAL_LDLIBS := -llog
 
 ifeq ($(API), riru)
@@ -30,4 +30,3 @@ FORCE: ;
 
 $(call import-module,prefab/cxx)
 $(call import-module,prefab/riru)
-$(call import-module,prefab/dobby)

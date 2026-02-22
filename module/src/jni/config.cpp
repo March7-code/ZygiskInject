@@ -131,6 +131,41 @@ static std::optional<target_config> deserialize_target_config(const rapidjson::V
         result.thread_disguise_name = name;
     }
 
+    if (doc.HasMember("gadget_interaction")) {
+        auto &v = doc["gadget_interaction"];
+        if (v.IsString()) {
+            result.gadget_interaction = v.GetString();
+        }
+    }
+
+    if (doc.HasMember("gadget_listen_port")) {
+        auto &v = doc["gadget_listen_port"];
+        if (v.IsUint()) {
+            result.gadget_listen_port = (uint16_t) v.GetUint();
+        }
+    }
+
+    if (doc.HasMember("gadget_connect_address")) {
+        auto &v = doc["gadget_connect_address"];
+        if (v.IsString()) {
+            result.gadget_connect_address = v.GetString();
+        }
+    }
+
+    if (doc.HasMember("gadget_connect_port")) {
+        auto &v = doc["gadget_connect_port"];
+        if (v.IsUint()) {
+            result.gadget_connect_port = (uint16_t) v.GetUint();
+        }
+    }
+
+    if (doc.HasMember("gadget_on_load")) {
+        auto &v = doc["gadget_on_load"];
+        if (v.IsString()) {
+            result.gadget_on_load = v.GetString();
+        }
+    }
+
     return result;
 }
 

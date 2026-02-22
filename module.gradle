@@ -2,9 +2,9 @@ ext {
     // Magisk Module
     magiskModuleId = "zygiskfrida"
     moduleName = "ZygiskFrida"
-    moduleAuthor = "lico-n"
+    moduleAuthor = "March7"
     moduleDescription = "Injects frida gadget via zygisk."
-    moduleVersion = "v1.9.0"
+    moduleVersion = "v1.9.1"
     moduleVersionCode = 12
 
     // Riru
