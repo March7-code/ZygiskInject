@@ -43,8 +43,10 @@ struct target_config{
     // Anti-cheat detection tracer settings.
     // tracer_mode: "off" (default), "probe" (log only), "block" (phase-2 hook).
     // tracer_log_path: log file for probe mode.
+    // tracer_verbose_logs: when true, emit detailed per-read debug logs.
     std::string tracer_mode = "off";
     std::string tracer_log_path = "/data/local/tmp/re.zyg.fri/syscall_trace.log";
+    bool tracer_verbose_logs = false;
 };
 
 std::optional<target_config> load_config(std::string const& module_dir, std::string const& app_name);

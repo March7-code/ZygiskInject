@@ -25,7 +25,8 @@
             "gadget_connect_use_unix_proxy": false,
             "gadget_connect_unix_name": "",
             "tracer_mode": "probe",
-            "tracer_log_path": "/data/local/tmp/re.zyg.fri/syscall_trace.log"
+            "tracer_log_path": "/data/local/tmp/re.zyg.fri/syscall_trace.log",
+            "tracer_verbose_logs": false
         }
     ]
 }

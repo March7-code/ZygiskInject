@@ -12,6 +12,7 @@
 #include <sys/un.h>
 #include <netdb.h>
 #include <cstddef>
+#include <cstdint>
 #include <cerrno>
 #include <cstring>
 
@@ -55,6 +56,14 @@ static bool write_u16(int fd, uint16_t value) {
 }
 
 static bool read_u16(int fd, uint16_t &value) {
+    return read(fd, &value, sizeof(value)) == sizeof(value);
+}
+
+static bool write_u8(int fd, uint8_t value) {
+    return write(fd, &value, sizeof(value)) == sizeof(value);
+}
+
+static bool read_u8(int fd, uint8_t &value) {
     return read(fd, &value, sizeof(value)) == sizeof(value);
 }
 
@@ -325,7 +334,7 @@ static std::string companion_copy_to_appdir(const std::string &src_path,
 //              -> send abstract unix socket name (empty = failure)
 //      - "off": no-op
 //   4. recv tracer_mode:
-//      - "probe": recv target_pid + log_path -> launch tracer
+//      - "probe": recv target_pid + log_path + tracer_verbose_logs -> launch tracer
 //      - others: no-op
 // ---------------------------------------------------------------------------
 
@@ -404,9 +413,11 @@ static void companion_handler(int client) {
         if (read(client, &target_pid, sizeof(target_pid)) == sizeof(target_pid)) {
             std::string log_path;
             read_string(client, log_path);
+            uint8_t tracer_verbose_logs = 0;
+            read_u8(client, tracer_verbose_logs);
             LOGI("[companion] launching tracer for pid %u, log=%s",
                  target_pid, log_path.c_str());
-            launch_tracer((pid_t)target_pid, log_path);
+            launch_tracer((pid_t)target_pid, log_path, tracer_verbose_logs != 0);
         }
     }
 #endif
@@ -524,6 +535,7 @@ class MyModule : public zygisk::ModuleBase {
             uint32_t my_pid = (uint32_t)getpid();
             ::write(sock, &my_pid, sizeof(my_pid));
             write_string(sock, cfg->tracer_log_path);
+            write_u8(sock, cfg->tracer_verbose_logs ? 1 : 0);
         } else {
             write_string(sock, "off");
         }

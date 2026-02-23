@@ -23,6 +23,7 @@
 
 static FILE *g_log_fp = nullptr;
 static pid_t g_target_pid = 0;
+static bool g_verbose_logs = false;
 
 // Forward declarations
 static void refresh_maps_cache(pid_t pid);
@@ -314,7 +315,9 @@ static bool tamper_maps_read_chunk(pid_t pid, uint64_t buf_addr, size_t bytes_re
         if (buf[space_pos + 2] == 'x') {
             buf[space_pos + 2] = '-';  // r-xp -> r--p
             tampered = true;
-            LOGI(TAG "maps_bypass: hid executable perm for protected lib");
+            if (g_verbose_logs) {
+                LOGI(TAG "maps_bypass: hid executable perm for protected lib");
+            }
         }
     }
 
@@ -345,7 +348,7 @@ static bool tamper_maps_read_stream(pid_t pid,
 
     maps_fd_state &state = it->second;
     if (!state.tamper_enabled) {
-        if (g_log_fp) {
+        if (g_verbose_logs && g_log_fp) {
             fprintf(g_log_fp,
                     "[maps_bypass] stream skip (disabled): tid=%d tgid=%d fd=%llu bytes=%zu pos=%zu\n",
                     pid, key.tgid, (unsigned long long)fd_val, bytes_read, state.stream_pos);
@@ -710,8 +713,9 @@ static void log_syscall(pid_t pid, const char *name,
 // Public API
 // =========================================================================
 
-void syscall_handler_init(pid_t target_pid, const std::string &log_path) {
+void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool verbose_logs) {
     g_target_pid = target_pid;
+    g_verbose_logs = verbose_logs;
     g_maps_stage_start_ms = now_ms();
     g_stat_total = g_stat_filtered = g_stat_logged = g_stat_tampered = 0;
     g_stat_last_report = now_ms();
@@ -795,7 +799,7 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
                 std::string caller = resolve_caller_cached(pid, pc);
                 log_syscall(pid, "openat", path.c_str(), caller.c_str());
                 g_stat_logged++;
-                if (g_log_fp) {
+                if (g_verbose_logs && g_log_fp) {
                     fprintf(g_log_fp,
                             "[maps_bypass] detected openat on %s\n",
                             path.c_str());
@@ -850,14 +854,14 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
                     }
                     g_maps_fd_states[key] = std::move(state);
                 }
-                if (g_log_fp) {
+                if (g_verbose_logs && g_log_fp) {
                     fprintf(g_log_fp,
                             "[maps_bypass] late-track maps fd: tid=%d tgid=%d fd=%llu path=%s\n",
                             pid, key.tgid, (unsigned long long)fd_val, fd_path.c_str());
                 }
             } else if (is_proc_status_path(fd_path)) {
                 g_status_fds.insert(key);
-                if (g_log_fp) {
+                if (g_verbose_logs && g_log_fp) {
                     fprintf(g_log_fp,
                             "[tamper] late-track status fd: tid=%d tgid=%d fd=%llu path=%s\n",
                             pid, key.tgid, (unsigned long long)fd_val, fd_path.c_str());
@@ -867,7 +871,7 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
 
         // Check maps fds first (checksum bypass)
         if (g_maps_fds.count(key)) {
-            if (g_log_fp) {
+            if (g_verbose_logs && g_log_fp) {
                 fprintf(g_log_fp,
                         "[maps_bypass] read wait: tid=%d tgid=%d fd=%llu\n",
                         pid, key.tgid, (unsigned long long)fd_val);
@@ -988,9 +992,11 @@ void handle_syscall_exit(pid_t pid) {
                     }
                     g_maps_fd_states[key] = std::move(state);
 
-                    LOGI(TAG "maps_bypass: tracking maps fd=%lld for pid %d",
-                         (long long)ret, pid);
-                    if (g_log_fp) {
+                    if (g_verbose_logs) {
+                        LOGI(TAG "maps_bypass: tracking maps fd=%lld for pid %d",
+                             (long long)ret, pid);
+                    }
+                    if (g_verbose_logs && g_log_fp) {
                         fprintf(g_log_fp,
                                 "[maps_bypass] tracking maps fd=%lld -> %s (enabled=%d)\n",
                                 (long long)ret, target,
@@ -1000,15 +1006,19 @@ void handle_syscall_exit(pid_t pid) {
                 } else if (is_proc_status_path(path_str)) {
                     tracked_fd_key key = make_fd_key(pid, (uint64_t)ret);
                     g_status_fds.insert(key);
-                    LOGI(TAG "tracking status fd=%lld for pid %d",
-                         (long long)ret, pid);
+                    if (g_verbose_logs) {
+                        LOGI(TAG "tracking status fd=%lld for pid %d",
+                             (long long)ret, pid);
+                    }
                 }
             } else {
                 // Fallback: couldn't readlink, try status fd tracking
                 tracked_fd_key key = make_fd_key(pid, (uint64_t)ret);
                 g_status_fds.insert(key);
-                LOGI(TAG "tracking status fd=%lld for pid %d (fallback)",
-                     (long long)ret, pid);
+                if (g_verbose_logs) {
+                    LOGI(TAG "tracking status fd=%lld for pid %d (fallback)",
+                         (long long)ret, pid);
+                }
             }
         }
     } else if (nr == __NR_read
@@ -1016,7 +1026,7 @@ void handle_syscall_exit(pid_t pid) {
                || nr == __NR_pread64
 #endif
     ) {
-        if (g_log_fp) {
+        if (g_verbose_logs && g_log_fp) {
             uint64_t fd_val = have_pending ? pending.args[0] : tracer_get_arg(regs, 0);
             tracked_fd_key key = make_fd_key(pid, fd_val);
             int maps_enabled = -1;
@@ -1043,14 +1053,14 @@ void handle_syscall_exit(pid_t pid) {
                 bool tampered = tamper_maps_read_stream(pid, fd_val, buf_addr, (size_t)ret);
                 if (tampered) {
                     g_stat_tampered++;
-                    if (g_log_fp) {
+                    if (g_verbose_logs && g_log_fp) {
                         fprintf(g_log_fp,
                                 "[maps_bypass] tampered read() on maps fd=%llu, "
                                 "%lld bytes\n",
                                 (unsigned long long)fd_val, (long long)ret);
                         fflush(g_log_fp);
                     }
-                } else if (g_log_fp) {
+                } else if (g_verbose_logs && g_log_fp) {
                     fprintf(g_log_fp,
                             "[maps_bypass] read seen but unchanged: tid=%d tgid=%d fd=%llu bytes=%lld\n",
                             pid, key.tgid, (unsigned long long)fd_val, (long long)ret);

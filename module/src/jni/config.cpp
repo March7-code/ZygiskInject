@@ -195,6 +195,13 @@ static std::optional<target_config> deserialize_target_config(const rapidjson::V
         }
     }
 
+    if (doc.HasMember("tracer_verbose_logs")) {
+        auto &v = doc["tracer_verbose_logs"];
+        if (v.IsBool()) {
+            result.tracer_verbose_logs = v.GetBool();
+        }
+    }
+
     return result;
 }
 

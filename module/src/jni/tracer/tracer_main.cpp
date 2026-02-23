@@ -29,7 +29,7 @@ static constexpr long kPtraceOptions =
 // Tracer process main logic (runs as root in a forked child)
 // ---------------------------------------------------------------------------
 
-static void tracer_process(pid_t target_pid, const std::string &log_path) {
+static void tracer_process(pid_t target_pid, const std::string &log_path, bool verbose_logs) {
     LOGI(TAG "tracer started, target pid=%d, log=%s",
          target_pid, log_path.c_str());
 
@@ -67,7 +67,7 @@ static void tracer_process(pid_t target_pid, const std::string &log_path) {
     }
 
     // 4. Initialize syscall handler (opens log file)
-    syscall_handler_init(target_pid, log_path);
+    syscall_handler_init(target_pid, log_path, verbose_logs);
 
     // 5. Resume target
     if (ptrace(PTRACE_CONT, target_pid, nullptr, nullptr) < 0) {
@@ -156,7 +156,7 @@ static void tracer_process(pid_t target_pid, const std::string &log_path) {
 // Public API: fork a tracer child process
 // ---------------------------------------------------------------------------
 
-pid_t launch_tracer(pid_t target_pid, const std::string &log_path) {
+pid_t launch_tracer(pid_t target_pid, const std::string &log_path, bool verbose_logs) {
     pid_t child = fork();
     if (child < 0) {
         LOGE(TAG "fork failed: %s", strerror(errno));
@@ -165,7 +165,7 @@ pid_t launch_tracer(pid_t target_pid, const std::string &log_path) {
     if (child == 0) {
         // In tracer child — detach from parent's session
         setsid();
-        tracer_process(target_pid, log_path);
+        tracer_process(target_pid, log_path, verbose_logs);
         _exit(0);  // unreachable
     }
     LOGI(TAG "launched tracer pid=%d for target pid=%d", child, target_pid);
