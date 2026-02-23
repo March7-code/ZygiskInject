@@ -27,11 +27,17 @@ struct target_config{
     // gadget_listen_port: TCP port for listen mode (0 = default 27042).
     // gadget_connect_address: host for connect mode (default "127.0.0.1").
     // gadget_connect_port: TCP port for connect mode (default 27052).
+    // gadget_connect_use_unix_proxy: when true, module starts a UNIX socket
+    //   proxy and rewrites gadget connect target to that socket.
+    // gadget_connect_unix_name: optional abstract UNIX socket name to use when
+    //   gadget_connect_use_unix_proxy=true. Empty = auto-generate.
     // on_load: "wait" (freeze until ready) or "resume" (continue immediately).
     std::string gadget_interaction = "listen";
     uint16_t gadget_listen_port = 0;
     std::string gadget_connect_address = "127.0.0.1";
     uint16_t gadget_connect_port = 27052;
+    bool gadget_connect_use_unix_proxy = false;
+    std::string gadget_connect_unix_name;
     std::string gadget_on_load = "resume";
 
     // Anti-cheat detection tracer settings.

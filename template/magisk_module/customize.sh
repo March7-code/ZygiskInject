@@ -81,21 +81,40 @@ fi
 ui_print "- Extracting bundled frida gadget"
 
 mkdir -p "$TMP_MODULE_DIR"
-extract "$ZIPFILE" "gadget/libgadget-$ARCH.so.xz" "$TMP_MODULE_DIR" true
-mv "$TMP_MODULE_DIR/libgadget-$ARCH.so.xz" "$TMP_MODULE_DIR/libgadget.so.xz"
-rm "$TMP_MODULE_DIR/libgadget.so"
-$BUSYBOX_BIN unxz "$TMP_MODULE_DIR/libgadget.so.xz"
-rm "$TMP_MODULE_DIR/libgadget.so.xz"
+
+# Support both xz-compressed (.so.xz) and raw (.so) gadget formats.
+# Local custom-built gadgets are packaged as raw .so files.
+if unzip -l "$ZIPFILE" "gadget/libgadget-$ARCH.so.xz" >/dev/null 2>&1; then
+  extract "$ZIPFILE" "gadget/libgadget-$ARCH.so.xz" "$TMP_MODULE_DIR" true
+  mv "$TMP_MODULE_DIR/libgadget-$ARCH.so.xz" "$TMP_MODULE_DIR/libgadget.so.xz"
+  rm -f "$TMP_MODULE_DIR/libgadget.so"
+  $BUSYBOX_BIN unxz "$TMP_MODULE_DIR/libgadget.so.xz"
+  rm -f "$TMP_MODULE_DIR/libgadget.so.xz"
+elif unzip -l "$ZIPFILE" "gadget/libgadget-$ARCH.so" >/dev/null 2>&1; then
+  extract "$ZIPFILE" "gadget/libgadget-$ARCH.so" "$TMP_MODULE_DIR" true
+  mv "$TMP_MODULE_DIR/libgadget-$ARCH.so" "$TMP_MODULE_DIR/libgadget.so"
+  ui_print "- Using local (uncompressed) gadget"
+else
+  abort "! No frida gadget found for $ARCH in zip"
+fi
 
 if [ "$IS64BIT" = true ]; then
   ARCH32="arm"
   [ "$ARCH" = "x64" ] && ARCH32="x86"
 
-  extract "$ZIPFILE" "gadget/libgadget-$ARCH32.so.xz" "$TMP_MODULE_DIR" true
-  mv "$TMP_MODULE_DIR/libgadget-$ARCH32.so.xz" "$TMP_MODULE_DIR/libgadget32.so.xz"
-  rm "$TMP_MODULE_DIR/libgadget32.so"
-  $BUSYBOX_BIN unxz "$TMP_MODULE_DIR/libgadget32.so.xz"
-  rm "$TMP_MODULE_DIR/libgadget32.so.xz"
+  if unzip -l "$ZIPFILE" "gadget/libgadget-$ARCH32.so.xz" >/dev/null 2>&1; then
+    extract "$ZIPFILE" "gadget/libgadget-$ARCH32.so.xz" "$TMP_MODULE_DIR" true
+    mv "$TMP_MODULE_DIR/libgadget-$ARCH32.so.xz" "$TMP_MODULE_DIR/libgadget32.so.xz"
+    rm -f "$TMP_MODULE_DIR/libgadget32.so"
+    $BUSYBOX_BIN unxz "$TMP_MODULE_DIR/libgadget32.so.xz"
+    rm -f "$TMP_MODULE_DIR/libgadget32.so.xz"
+  elif unzip -l "$ZIPFILE" "gadget/libgadget-$ARCH32.so" >/dev/null 2>&1; then
+    extract "$ZIPFILE" "gadget/libgadget-$ARCH32.so" "$TMP_MODULE_DIR" true
+    mv "$TMP_MODULE_DIR/libgadget-$ARCH32.so" "$TMP_MODULE_DIR/libgadget32.so"
+    ui_print "- Using local (uncompressed) 32-bit gadget"
+  else
+    ui_print "! No 32-bit frida gadget found for $ARCH32, skipping"
+  fi
 fi
 
 extract "$ZIPFILE" "config.json.example" "$TMP_MODULE_DIR" true

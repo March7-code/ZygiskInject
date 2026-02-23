@@ -19,6 +19,8 @@ dependencies {
 }
 
 task downloadFrida(type: Download) {
+    enabled = !useLocalGadget
+
     def downloadArchs = ["arm", "arm64", "x86_64", "x86"]
     def magiskArchs = ["arm", "arm64", "x64", "x86"]
 
@@ -39,6 +41,78 @@ task downloadFrida(type: Download) {
     quiet true
     eachFile { f ->
         f.name = downloads[f.sourceURL.toString()]
+    }
+}
+
+// Copy local frida-gadget .so files into gadget/ directory.
+// Supports flexible naming:
+//   libgadget.so           -> treated as arm64 (single-arch shortcut)
+//   frida-gadget-arm64.so  -> explicit arch naming
+// They are copied as: libgadget-{arch}.so (raw, no xz compression)
+task prepareLocalGadget {
+    enabled = useLocalGadget
+
+    doFirst {
+        def gadgetDir = file("$rootDir/gadget")
+        def srcDir = file(localGadgetDir)
+
+        if (!srcDir.exists()) {
+            throw new GradleException(
+                "localGadgetDir not found: ${srcDir.absolutePath}\n" +
+                "Create this directory and place your frida-gadget .so files in it.")
+        }
+
+        // Clean old downloaded xz files and old local copies
+        gadgetDir.listFiles()?.each { f ->
+            if (f.name.startsWith("libgadget-") && (f.name.endsWith(".so.xz") || f.name.endsWith(".so"))) {
+                f.delete()
+            }
+        }
+
+        // arch mapping: source filename suffix -> output filename
+        def archMap = [
+            "arm64"  : "arm64",
+            "arm"    : "arm",
+            "x86_64" : "x64",
+            "x86"    : "x86",
+        ]
+
+        int copied = 0
+
+        // Try explicit arch names first: frida-gadget-{arch}.so
+        archMap.each { srcArch, dstArch ->
+            def srcFile = new File(srcDir, "frida-gadget-${srcArch}.so")
+            if (!srcFile.exists()) return
+            def dstFile = new File(gadgetDir, "libgadget-${dstArch}.so")
+            dstFile.bytes = srcFile.bytes
+            logger.lifecycle("Copied local gadget: ${srcFile.name} -> ${dstFile.name}")
+            copied++
+        }
+
+        // Fallback: if nothing matched, try libgadget.so as arm64
+        if (copied == 0) {
+            def fallback = new File(srcDir, "libgadget.so")
+            if (fallback.exists()) {
+                def dstFile = new File(gadgetDir, "libgadget-arm64.so")
+                dstFile.bytes = fallback.bytes
+                logger.lifecycle("Copied local gadget: ${fallback.name} -> ${dstFile.name} (arm64)")
+                copied++
+            }
+        }
+
+        if (copied == 0) {
+            throw new GradleException(
+                "No gadget .so found in ${srcDir.absolutePath}\n" +
+                "Expected: libgadget.so or frida-gadget-{arm64,arm,x86_64,x86}.so")
+        }
+    }
+}
+
+task prepareGadget {
+    if (useLocalGadget) {
+        dependsOn prepareLocalGadget
+    } else {
+        dependsOn downloadFrida
     }
 }
 
@@ -105,7 +179,7 @@ afterEvaluate {
 
         task("prepareMagiskFiles${variantCapped}", type: Sync) {
             dependsOn("assemble$variantCapped")
-            dependsOn downloadFrida
+            dependsOn prepareGadget
 
             def templatePath = "$rootDir/template/magisk_module"
 

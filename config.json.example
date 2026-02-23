@@ -17,7 +17,15 @@
                         "path": "/data/local/tmp/re.zyg.fri/libgadget-child.so"
                     }
                 ]
-            }
+            },
+            "gadget_interaction": "listen",
+            "gadget_listen_port": 0,
+            "gadget_connect_address": "127.0.0.1",
+            "gadget_connect_port": 27052,
+            "gadget_connect_use_unix_proxy": false,
+            "gadget_connect_unix_name": "",
+            "tracer_mode": "probe",
+            "tracer_log_path": "/data/local/tmp/re.zyg.fri/syscall_trace.log"
         }
     ]
 }

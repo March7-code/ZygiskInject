@@ -14,4 +14,12 @@ ext {
 
     // Frida
     fridaVersion = "17.7.3"
+
+    // Local gadget: set to true to use your own compiled frida-gadget .so files
+    // instead of downloading from GitHub releases.
+    // Place your .so files in localGadgetDir:
+    //   libgadget.so                -> auto-detected as arm64
+    //   frida-gadget-{arch}.so      -> explicit arch (arm64/arm/x86_64/x86)
+    useLocalGadget = false
+    localGadgetDir = "${rootDir}/local_gadget"
 }

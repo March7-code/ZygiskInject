@@ -87,7 +87,14 @@ seccomp_bpf_program build_default_io_filter() {
 
     // Needed for TracerPid hiding: intercept read() so we can tamper with
     // the buffer content after the kernel writes /proc/self/status data.
+    // Also used for ELF checksum bypass: tamper read() on library fds.
     nrs.push_back(__NR_read);
+#ifdef __NR_pread64
+    // Some libc paths read procfs via pread64().
+    nrs.push_back(__NR_pread64);
+#endif
+    // Track fd lifecycle so reused fd numbers do not keep stale tamper state.
+    nrs.push_back(__NR_close);
 
     return build_seccomp_filter(nrs);
 }

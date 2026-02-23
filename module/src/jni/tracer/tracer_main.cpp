@@ -127,15 +127,20 @@ static void tracer_process(pid_t target_pid, const std::string &log_path) {
             continue;
         }
 
-        // group-stop or signal-delivery-stop — forward the signal
-        int inject_sig = 0;
-        if (sig == (SIGTRAP | 0x80) && g_awaiting_exit.count(stopped_pid)) {
-            // Syscall-exit stop: the syscall has completed, tamper now
+        // If we are waiting for syscall-exit on this tid, accept both
+        // SIGTRAP|0x80 (normal TRACESYSGOOD case) and plain SIGTRAP.
+        // Some kernels/devices report the exit-stop as plain SIGTRAP after
+        // a SECCOMP stop + PTRACE_SYSCALL sequence.
+        if (g_awaiting_exit.count(stopped_pid) &&
+            (sig == (SIGTRAP | 0x80) || (sig == SIGTRAP && event == 0))) {
             handle_syscall_exit(stopped_pid);
             g_awaiting_exit.erase(stopped_pid);
             ptrace(PTRACE_CONT, stopped_pid, nullptr, nullptr);
             continue;
         }
+
+        // group-stop or signal-delivery-stop — forward the signal
+        int inject_sig = 0;
         if (sig != SIGTRAP && sig != (SIGTRAP | 0x80)) {
             inject_sig = sig;
         }

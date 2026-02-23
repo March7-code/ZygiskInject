@@ -2,9 +2,16 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <vector>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netdb.h>
+#include <cstddef>
 #include <cerrno>
 #include <cstring>
 
@@ -41,6 +48,203 @@ static bool read_string(int fd, std::string &out) {
     if (len == 0) { out.clear(); return true; }
     out.resize(len);
     return read(fd, &out[0], len) == (ssize_t) len;
+}
+
+static bool write_u16(int fd, uint16_t value) {
+    return write(fd, &value, sizeof(value)) == sizeof(value);
+}
+
+static bool read_u16(int fd, uint16_t &value) {
+    return read(fd, &value, sizeof(value)) == sizeof(value);
+}
+
+static bool write_all(int fd, const void *buf, size_t len) {
+    auto *p = static_cast<const uint8_t *>(buf);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, p + off, len - off);
+        if (n <= 0) return false;
+        off += (size_t)n;
+    }
+    return true;
+}
+
+static int connect_tcp_endpoint(const std::string &host, uint16_t port) {
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = 0;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned int)port);
+
+    struct addrinfo *res = nullptr;
+    if (getaddrinfo(host.c_str(), port_str, &hints, &res) != 0) {
+        return -1;
+    }
+
+    int fd = -1;
+    for (auto *ai = res; ai != nullptr; ai = ai->ai_next) {
+        int s = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+        if (s < 0) continue;
+        if (connect(s, ai->ai_addr, ai->ai_addrlen) == 0) {
+            fd = s;
+            break;
+        }
+        close(s);
+    }
+
+    freeaddrinfo(res);
+    return fd;
+}
+
+static std::string sanitize_socket_name(const std::string &name) {
+    std::string out;
+    out.reserve(name.size());
+    for (char c : name) {
+        bool ok = (c >= 'a' && c <= 'z') ||
+                  (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') ||
+                  c == '.' || c == '_' || c == '-';
+        out.push_back(ok ? c : '_');
+    }
+    return out;
+}
+
+static bool is_numeric_service_name(const std::string &name) {
+    if (name.empty() || name.size() > 5) return false;
+    unsigned value = 0;
+    for (char c : name) {
+        if (c < '0' || c > '9') return false;
+        value = value * 10u + (unsigned)(c - '0');
+        if (value > 65535u) return false;
+    }
+    return value != 0;
+}
+
+static std::string generate_unix_socket_name(const std::string &app_name) {
+    static uint32_t counter = 0;
+    // NOTE:
+    // frida-gadget connect-mode still runs its HTTP/WebSocket host parser on
+    // the "address" field. Non-numeric abstract UNIX names (e.g. "a.b.c")
+    // trigger "Unknown service ... in hostname 'unix:...'" in GLib.
+    // Use a numeric abstract name (1..65535) so parsing always succeeds.
+    uint32_t h = 5381u;
+    for (char c : app_name) {
+        h = ((h << 5u) + h) + (uint8_t) c;  // djb2
+    }
+    uint32_t seed = h ^ (uint32_t) getpid() ^ counter++;
+    uint32_t value = 10000u + (seed % 50000u);  // 10000..59999
+    return std::to_string(value);
+}
+
+static int bind_abstract_unix_listener(const std::string &name) {
+    if (name.empty()) return -1;
+    if (name.size() > sizeof(sockaddr_un().sun_path) - 2) return -1;
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';  // abstract namespace
+    memcpy(addr.sun_path + 1, name.data(), name.size());
+    socklen_t len = (socklen_t)(offsetof(sockaddr_un, sun_path) + 1 + name.size());
+
+    if (bind(fd, reinterpret_cast<sockaddr *>(&addr), len) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 1) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void run_unix_tcp_proxy_once(int listen_fd,
+                                    const std::string &target_host,
+                                    uint16_t target_port) {
+    pollfd accept_pfd{listen_fd, POLLIN, 0};
+    int pr = poll(&accept_pfd, 1, 300000);  // wait up to 5m for gadget
+    if (pr <= 0) {
+        close(listen_fd);
+        return;
+    }
+
+    int local_fd = accept(listen_fd, nullptr, nullptr);
+    close(listen_fd);
+    if (local_fd < 0) return;
+
+    int remote_fd = connect_tcp_endpoint(target_host, target_port);
+    if (remote_fd < 0) {
+        close(local_fd);
+        return;
+    }
+
+    uint8_t buf[8192];
+    pollfd fds[2] = {
+            {local_fd, POLLIN, 0},
+            {remote_fd, POLLIN, 0},
+    };
+
+    while (true) {
+        int n = poll(fds, 2, -1);
+        if (n <= 0) break;
+
+        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+
+        if (fds[0].revents & POLLIN) {
+            ssize_t r = read(local_fd, buf, sizeof(buf));
+            if (r <= 0 || !write_all(remote_fd, buf, (size_t)r)) break;
+        }
+        if (fds[1].revents & POLLIN) {
+            ssize_t r = read(remote_fd, buf, sizeof(buf));
+            if (r <= 0 || !write_all(local_fd, buf, (size_t)r)) break;
+        }
+    }
+
+    close(remote_fd);
+    close(local_fd);
+}
+
+static std::string companion_start_unix_proxy(const std::string &app_name,
+                                              const std::string &target_host,
+                                              uint16_t target_port,
+                                              const std::string &preferred_name) {
+    if (target_host.empty() || target_port == 0) return "";
+
+    std::string preferred = sanitize_socket_name(preferred_name);
+    if (!preferred.empty() && !is_numeric_service_name(preferred)) {
+        LOGW("[companion] preferred unix name '%s' is not numeric, ignoring", preferred.c_str());
+        preferred.clear();
+    }
+
+    std::string name;
+    int listen_fd = -1;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        if (!preferred.empty() && attempt == 0) {
+            name = preferred;
+        } else {
+            name = generate_unix_socket_name(app_name);
+        }
+        listen_fd = bind_abstract_unix_listener(name);
+        if (listen_fd >= 0) break;
+    }
+    if (listen_fd < 0) {
+        LOGW("[companion] failed to allocate unix proxy listener");
+        return "";
+    }
+
+    std::thread([listen_fd, target_host, target_port, name]() {
+        LOGI("[companion] unix proxy started: abstract=%s -> %s:%u",
+             name.c_str(), target_host.c_str(), (unsigned int)target_port);
+        run_unix_tcp_proxy_once(listen_fd, target_host, target_port);
+        LOGI("[companion] unix proxy finished: abstract=%s", name.c_str());
+    }).detach();
+
+    return name;
 }
 
 // ---------------------------------------------------------------------------
@@ -111,11 +315,18 @@ static std::string companion_copy_to_appdir(const std::string &src_path,
 }
 
 // ---------------------------------------------------------------------------
-// Companion handler — runs as root
+// Companion handler (runs as root)
 // Protocol:
 //   1. recv app_name  -> send config JSON (empty string = not found)
 //   2. recv lib_path  -> send tmp_path (empty string = error)
 //      repeat until lib_path == "" (sentinel)
+//   3. recv unix_proxy_mode:
+//      - "on": recv target_host, target_port, preferred_name
+//              -> send abstract unix socket name (empty = failure)
+//      - "off": no-op
+//   4. recv tracer_mode:
+//      - "probe": recv target_pid + log_path -> launch tracer
+//      - others: no-op
 // ---------------------------------------------------------------------------
 
 static void companion_handler(int client) {
@@ -165,10 +376,27 @@ static void companion_handler(int client) {
         write_string(client, tmp_path);  // empty on failure
     }
 
-    // Step 3: tracer launch request (arm64 only)
-    // Protocol: recv tracer_mode string
-    //   if "probe" -> recv target_pid (uint32), recv log_path -> launch tracer
-    //   otherwise  -> no-op
+    // Step 3: optional unix socket proxy for gadget connect mode.
+    // Request:
+    //   mode "on" + target_host + target_port + preferred_name
+    // Response:
+    //   abstract unix socket name (empty on failure)
+    std::string unix_proxy_mode;
+    if (read_string(client, unix_proxy_mode) && unix_proxy_mode == "on") {
+        std::string target_host, preferred_name;
+        uint16_t target_port = 0;
+        if (read_string(client, target_host) &&
+            read_u16(client, target_port) &&
+            read_string(client, preferred_name)) {
+            std::string unix_name = companion_start_unix_proxy(app_name, target_host,
+                                                                target_port, preferred_name);
+            write_string(client, unix_name);
+        } else {
+            write_string(client, "");
+        }
+    }
+
+    // Step 4: tracer launch request (arm64 only)
 #if defined(__aarch64__)
     std::string tracer_mode;
     if (read_string(client, tracer_mode) && tracer_mode == "probe") {
@@ -182,7 +410,6 @@ static void companion_handler(int client) {
         }
     }
 #endif
-
 }
 
 REGISTER_ZYGISK_COMPANION(companion_handler)
@@ -202,6 +429,7 @@ class MyModule : public zygisk::ModuleBase {
         const char *raw = env->GetStringUTFChars(args->nice_name, nullptr);
         app_name = std::string(raw);
         env->ReleaseStringUTFChars(args->nice_name, raw);
+        gadget_connect_override_address.clear();
 
         int sock = api->connectCompanion();
         if (sock < 0) {
@@ -232,6 +460,13 @@ class MyModule : public zygisk::ModuleBase {
             return;
         }
 
+        bool gadget_connect_mode = (cfg->gadget_interaction == "connect");
+        if (!gadget_connect_mode && cfg->gadget_connect_use_unix_proxy) {
+            gadget_connect_mode = true;
+            LOGW("[module] gadget_connect_use_unix_proxy=true but interaction=%s; forcing connect mode",
+                 cfg->gadget_interaction.c_str());
+        }
+
         // Request tmp file for each injected library
         for (auto &lib_path : cfg->injected_libraries) {
             if (!write_string(sock, lib_path)) break;
@@ -249,7 +484,37 @@ class MyModule : public zygisk::ModuleBase {
         // Send empty sentinel to end lib copy session
         write_string(sock, "");
 
-        // Step 3: request tracer launch if configured (arm64 only)
+        // Step 3: optionally request a unix proxy for gadget connect mode.
+        // The proxy runs in companion (root) and bridges:
+        //   gadget unix socket <-> original tcp target (address:port).
+        if (gadget_connect_mode &&
+            cfg->gadget_connect_use_unix_proxy &&
+            cfg->gadget_connect_address.rfind("unix:", 0) != 0) {
+            if (!write_string(sock, "on") ||
+                !write_string(sock, cfg->gadget_connect_address) ||
+                !write_u16(sock, cfg->gadget_connect_port) ||
+                !write_string(sock, cfg->gadget_connect_unix_name)) {
+                LOGW("[module] failed to request unix proxy");
+            } else {
+                std::string unix_name;
+                if (read_string(sock, unix_name) && !unix_name.empty()) {
+                    gadget_connect_override_address = "unix:" + unix_name;
+                    LOGI("[module] unix proxy ready for gadget connect: %s",
+                         gadget_connect_override_address.c_str());
+                } else {
+                    LOGW("[module] unix proxy request failed, fallback to tcp connect");
+                }
+            }
+        } else {
+            if (gadget_connect_mode &&
+                cfg->gadget_connect_use_unix_proxy &&
+                cfg->gadget_connect_address.rfind("unix:", 0) == 0) {
+                LOGI("[module] connect address already unix, skip unix proxy bridge");
+            }
+            write_string(sock, "off");
+        }
+
+        // Step 4: request tracer launch if configured (arm64 only)
         // The companion (root) will fork a tracer process that attaches
         // to our pid via ptrace. We send the request here in preAppSpecialize
         // because connectCompanion is only available at this stage.
@@ -312,6 +577,11 @@ class MyModule : public zygisk::ModuleBase {
         // custom listen port / on_load behaviour.  The file must exist before
         // dlopen, and we are already running as the app UID so we can write
         // into our own data dir.
+        bool gadget_connect_mode = (cfg->gadget_interaction == "connect");
+        if (!gadget_connect_mode && cfg->gadget_connect_use_unix_proxy) {
+            gadget_connect_mode = true;
+        }
+
         for (auto &lib_path : cfg->injected_libraries) {
             if (lib_path.find("/.zyg_") == std::string::npos) continue;
             // <name>.so  ->  <name>.config.so
@@ -319,10 +589,17 @@ class MyModule : public zygisk::ModuleBase {
 
             // Build Frida gadget config JSON based on interaction type
             std::string json;
-            if (cfg->gadget_interaction == "connect") {
+            if (gadget_connect_mode) {
+                std::string connect_address = cfg->gadget_connect_address;
+                if (!gadget_connect_override_address.empty()) {
+                    connect_address = gadget_connect_override_address;
+                }
+
                 json = "{\"interaction\":{\"type\":\"connect\"";
-                json += ",\"address\":\"" + cfg->gadget_connect_address + "\"";
-                json += ",\"port\":" + std::to_string(cfg->gadget_connect_port);
+                json += ",\"address\":\"" + connect_address + "\"";
+                if (connect_address.rfind("unix:", 0) != 0) {
+                    json += ",\"port\":" + std::to_string(cfg->gadget_connect_port);
+                }
                 json += ",\"on_load\":\"" + cfg->gadget_on_load + "\"";
                 json += "}}";
             } else {
@@ -356,6 +633,7 @@ class MyModule : public zygisk::ModuleBase {
     JNIEnv *env;
     std::string app_name;
     std::string companion_json;
+    std::string gadget_connect_override_address;
     // original lib_path -> tmp file path in app's data dir
     std::map<std::string, std::string> tmpfile_paths;
 };

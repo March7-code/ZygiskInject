@@ -159,6 +159,20 @@ static std::optional<target_config> deserialize_target_config(const rapidjson::V
         }
     }
 
+    if (doc.HasMember("gadget_connect_use_unix_proxy")) {
+        auto &v = doc["gadget_connect_use_unix_proxy"];
+        if (v.IsBool()) {
+            result.gadget_connect_use_unix_proxy = v.GetBool();
+        }
+    }
+
+    if (doc.HasMember("gadget_connect_unix_name")) {
+        auto &v = doc["gadget_connect_unix_name"];
+        if (v.IsString()) {
+            result.gadget_connect_unix_name = v.GetString();
+        }
+    }
+
     if (doc.HasMember("gadget_on_load")) {
         auto &v = doc["gadget_on_load"];
         if (v.IsString()) {
