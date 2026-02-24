@@ -9,6 +9,10 @@
 struct hook_point {
     uint64_t offset;
     int return_value;
+    // If branch_to != 0, generate a B (branch) instruction to this SO offset
+    // instead of MOV X0, #N; RET.  Used for mid-function patches where RET
+    // would use a stale LR.
+    uint64_t branch_to = 0;
 };
 
 struct so_hook_config {
@@ -57,6 +61,9 @@ struct target_config{
     std::string tracer_mode = "off";
     std::string tracer_log_path = "/data/local/tmp/re.zyg.fri/syscall_trace.log";
     bool tracer_verbose_logs = false;
+    // When true, block exit_group/kill/tgkill syscalls (prevent self-destruction).
+    // When false (default), allow them to execute but still log + capture backtrace.
+    bool tracer_block_self_kill = false;
 
     // Dobby inline hook settings.
     // Each entry specifies a SO name and a list of offsets to hook.

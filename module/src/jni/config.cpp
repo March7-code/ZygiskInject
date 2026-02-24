@@ -203,6 +203,13 @@ static std::optional<target_config> deserialize_target_config(const rapidjson::V
         }
     }
 
+    if (doc.HasMember("tracer_block_self_kill")) {
+        auto &v = doc["tracer_block_self_kill"];
+        if (v.IsBool()) {
+            result.tracer_block_self_kill = v.GetBool();
+        }
+    }
+
     // Dobby inline hook settings
     if (doc.HasMember("dobby_hooks")) {
         auto &arr = doc["dobby_hooks"];
@@ -227,6 +234,10 @@ static std::optional<target_config> deserialize_target_config(const rapidjson::V
                     hp.return_value = 0;
                     if (h.HasMember("return_value") && h["return_value"].IsInt()) {
                         hp.return_value = h["return_value"].GetInt();
+                    }
+                    hp.branch_to = 0;
+                    if (h.HasMember("branch_to") && h["branch_to"].IsString()) {
+                        hp.branch_to = strtoull(h["branch_to"].GetString(), nullptr, 0);
                     }
                     shc.hooks.push_back(hp);
                 }

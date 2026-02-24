@@ -41,34 +41,79 @@ static constexpr long kPtraceOptions =
 //
 // stage="post-inject": catch threads created during the injection sequence.
 // ---------------------------------------------------------------------------
-static void seize_existing_threads(pid_t target_pid, const char *stage) {
+// ---------------------------------------------------------------------------
+// "Stop the world": seize AND freeze every sibling thread.
+//
+// Unlike the old seize_existing_threads() which only PTRACE_SEIZE'd threads
+// (leaving them running), this function also PTRACE_INTERRUPT + waitpid each
+// thread so it is fully stopped.  We loop until /proc/<pid>/task stabilises,
+// guaranteeing no thread is missed — a stopped thread cannot clone().
+//
+// Returns the set of tids that were frozen (caller must PTRACE_CONT them).
+// ---------------------------------------------------------------------------
+static std::set<pid_t> freeze_all_threads(pid_t target_pid) {
+    std::set<pid_t> frozen;
     char task_dir[64];
     snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", target_pid);
-    DIR *dir = opendir(task_dir);
-    if (!dir) {
-        LOGW(TAG "seize_existing_threads: cannot open %s: %s", task_dir, strerror(errno));
-        return;
-    }
 
-    int seized = 0;
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        if (ent->d_name[0] == '.') continue;
-        pid_t tid = (pid_t)atoi(ent->d_name);
-        if (tid <= 0 || tid == target_pid) continue;  // skip leader (already seized)
-
-        long r = ptrace(PTRACE_SEIZE, tid, nullptr,
-                        (void *)(uintptr_t)kPtraceOptions);
-        if (r == 0) {
-            seized++;
-            g_filter_injected.insert(tid);
-        } else {
-            LOGW(TAG "seize_existing_threads: SEIZE tid %d failed: %s", tid, strerror(errno));
+    for (int pass = 0; pass < 8; pass++) {
+        int new_count = 0;
+        DIR *dir = opendir(task_dir);
+        if (!dir) {
+            LOGW(TAG "freeze_all_threads: cannot open %s: %s", task_dir, strerror(errno));
+            break;
         }
+
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            pid_t tid = (pid_t)atoi(ent->d_name);
+            if (tid <= 0 || tid == target_pid) continue;
+            if (frozen.count(tid)) continue;  // already frozen
+
+            // Seize
+            long r = ptrace(PTRACE_SEIZE, tid, nullptr,
+                            (void *)(uintptr_t)kPtraceOptions);
+            if (r < 0) {
+                LOGW(TAG "freeze_all_threads: SEIZE tid %d failed: %s", tid, strerror(errno));
+                continue;
+            }
+
+            // Interrupt to stop it
+            if (ptrace(PTRACE_INTERRUPT, tid, nullptr, nullptr) < 0) {
+                LOGW(TAG "freeze_all_threads: INTERRUPT tid %d failed: %s", tid, strerror(errno));
+                continue;
+            }
+
+            // Wait for the stop
+            int st = 0;
+            pid_t wp = waitpid(tid, &st, __WALL);
+            if (wp == tid && WIFSTOPPED(st)) {
+                frozen.insert(tid);
+                g_filter_injected.insert(tid);
+                new_count++;
+            } else {
+                LOGW(TAG "freeze_all_threads: waitpid tid %d returned wp=%d status=0x%x",
+                     tid, wp, st);
+            }
+        }
+        closedir(dir);
+
+        LOGI(TAG "freeze_all_threads: pass %d, froze %d new threads (total %zu)",
+             pass, new_count, frozen.size());
+
+        if (new_count == 0) break;  // stable — no new threads found
     }
-    closedir(dir);
-    LOGI(TAG "seize_existing_threads(%s): seized %d sibling threads",
-         stage, seized);
+
+    return frozen;
+}
+
+// Resume all previously frozen threads.
+static void resume_frozen_threads(const std::set<pid_t> &frozen) {
+    for (pid_t tid : frozen) {
+        ptrace(PTRACE_CONT, tid, nullptr, nullptr);
+    }
+    LOGI(TAG "resumed %zu frozen threads", frozen.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +121,7 @@ static void seize_existing_threads(pid_t target_pid, const char *stage) {
 // ---------------------------------------------------------------------------
 
 static void tracer_process(pid_t target_pid, const std::string &log_path, bool verbose_logs,
+                           bool block_self_kill,
                            const std::vector<so_hook_config> &so_hooks) {
     LOGI(TAG "tracer started, target pid=%d, log=%s",
          target_pid, log_path.c_str());
@@ -103,12 +149,13 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
         _exit(1);
     }
 
-    // 2b. Seize siblings before installing seccomp filter.
-    // This closes the "SECCOMP_RET_TRACE but untraced thread" race window.
-    seize_existing_threads(target_pid, "pre-inject");
+    // 2b. "Stop the world": seize + freeze ALL sibling threads.
+    // Every thread is stopped before the filter is installed, so no thread
+    // can escape with SECCOMP_RET_TRACE but without a ptrace tracer.
+    std::set<pid_t> frozen = freeze_all_threads(target_pid);
 
     // 3. Build and inject seccomp filter
-    g_bpf = build_default_io_filter();
+    g_bpf = build_default_io_filter(block_self_kill);
     LOGI(TAG "BPF filter: %zu instructions", g_bpf.size());
 
     if (inject_seccomp_filter(target_pid, g_bpf, &g_tsync_ok) < 0) {
@@ -119,13 +166,12 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
     g_filter_injected.insert(target_pid);
     LOGI(TAG "seccomp filter injected, tsync_ok=%d", g_tsync_ok ? 1 : 0);
 
-    // 3b. Catch any siblings created while we were injecting the filter.
-    seize_existing_threads(target_pid, "post-inject");
-
     // 4. Initialize syscall handler (opens log file)
-    syscall_handler_init(target_pid, log_path, verbose_logs, so_hooks);
+    syscall_handler_init(target_pid, log_path, verbose_logs, block_self_kill, so_hooks);
 
-    // 5. Resume target
+    // 5. Resume all frozen siblings, then the leader
+    resume_frozen_threads(frozen);
+
     if (ptrace(PTRACE_CONT, target_pid, nullptr, nullptr) < 0) {
         LOGE(TAG "PTRACE_CONT after inject failed: %s", strerror(errno));
         _exit(1);
@@ -147,11 +193,16 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
         }
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (WIFEXITED(status)) {
+                LOGE(TAG "pid %d exited with code %d", stopped_pid, WEXITSTATUS(status));
+            } else {
+                LOGE(TAG "pid %d killed by signal %d (%s)", stopped_pid,
+                     WTERMSIG(status), strsignal(WTERMSIG(status)));
+            }
             if (stopped_pid == target_pid) {
-                LOGI(TAG "target exited, tracer done");
+                LOGE(TAG "target process died, tracer done");
                 break;
             }
-            // A child thread/process exited
             continue;
         }
 
@@ -235,6 +286,7 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
 // ---------------------------------------------------------------------------
 
 pid_t launch_tracer(pid_t target_pid, const std::string &log_path, bool verbose_logs,
+                    bool block_self_kill,
                     const std::vector<so_hook_config> &so_hooks) {
     pid_t child = fork();
     if (child < 0) {
@@ -244,7 +296,7 @@ pid_t launch_tracer(pid_t target_pid, const std::string &log_path, bool verbose_
     if (child == 0) {
         // In tracer child — detach from parent's session
         setsid();
-        tracer_process(target_pid, log_path, verbose_logs, so_hooks);
+        tracer_process(target_pid, log_path, verbose_logs, block_self_kill, so_hooks);
         _exit(0);  // unreachable
     }
     LOGI(TAG "launched tracer pid=%d for target pid=%d", child, target_pid);

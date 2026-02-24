@@ -415,6 +415,8 @@ static void companion_handler(int client) {
             read_string(client, log_path);
             uint8_t tracer_verbose_logs = 0;
             read_u8(client, tracer_verbose_logs);
+            uint8_t tracer_block_self_kill = 0;
+            read_u8(client, tracer_block_self_kill);
 
             // Read SO hook configs
             std::vector<so_hook_config> so_hooks;
@@ -429,6 +431,7 @@ static void companion_handler(int client) {
                         hook_point hp{};
                         read(client, &hp.offset, sizeof(hp.offset));
                         read(client, &hp.return_value, sizeof(hp.return_value));
+                        read(client, &hp.branch_to, sizeof(hp.branch_to));
                         shc.hooks.push_back(hp);
                     }
                     so_hooks.push_back(std::move(shc));
@@ -437,7 +440,8 @@ static void companion_handler(int client) {
 
             LOGI("[companion] launching tracer for pid %u, log=%s, so_hooks=%zu",
                  target_pid, log_path.c_str(), so_hooks.size());
-            launch_tracer((pid_t)target_pid, log_path, tracer_verbose_logs != 0, so_hooks);
+            launch_tracer((pid_t)target_pid, log_path, tracer_verbose_logs != 0,
+                          tracer_block_self_kill != 0, so_hooks);
         }
     }
 #endif
@@ -558,6 +562,7 @@ class MyModule : public zygisk::ModuleBase {
             ::write(sock, &my_pid, sizeof(my_pid));
             write_string(sock, cfg->tracer_log_path);
             write_u8(sock, cfg->tracer_verbose_logs ? 1 : 0);
+            write_u8(sock, cfg->tracer_block_self_kill ? 1 : 0);
             // Send SO hook configs
             uint32_t num_so_hooks = (uint32_t)cfg->dobby_hooks.size();
             ::write(sock, &num_so_hooks, sizeof(num_so_hooks));
@@ -568,6 +573,7 @@ class MyModule : public zygisk::ModuleBase {
                 for (auto &hp : shc.hooks) {
                     ::write(sock, &hp.offset, sizeof(hp.offset));
                     ::write(sock, &hp.return_value, sizeof(hp.return_value));
+                    ::write(sock, &hp.branch_to, sizeof(hp.branch_to));
                 }
             }
         } else {

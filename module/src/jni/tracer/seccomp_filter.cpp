@@ -68,7 +68,7 @@ seccomp_bpf_program build_seccomp_filter(const std::vector<uint32_t> &syscall_nr
     return prog;
 }
 
-seccomp_bpf_program build_default_io_filter() {
+seccomp_bpf_program build_default_io_filter(bool block_self_kill) {
     std::vector<uint32_t> nrs;
 
     // ARM64 does NOT have __NR_open or __NR_access (removed in aarch64 ABI).
@@ -104,10 +104,14 @@ seccomp_bpf_program build_default_io_filter() {
     nrs.push_back(__NR_mprotect);
 #endif
 
-    // Process-killing syscalls: intercept to log caller PC and optionally block.
-    nrs.push_back(__NR_exit_group);
-    nrs.push_back(__NR_kill);
-    nrs.push_back(__NR_tgkill);
+    // Process-killing syscalls: only intercept when blocking is enabled.
+    // SECCOMP_RET_TRACE on untraced threads causes the kernel to return -ENOSYS,
+    // which silently blocks the syscall and can cause the app to hang.
+    if (block_self_kill) {
+        nrs.push_back(__NR_exit_group);
+        nrs.push_back(__NR_kill);
+        nrs.push_back(__NR_tgkill);
+    }
 
     return build_seccomp_filter(nrs);
 }

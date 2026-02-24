@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include "../log.h"
@@ -25,6 +26,7 @@
 static FILE *g_log_fp = nullptr;
 static pid_t g_target_pid = 0;
 static bool g_verbose_logs = false;
+static bool g_block_self_kill = false;
 
 // =========================================================================
 // SO load-time hook: patch functions via ptrace before .init_array runs
@@ -109,15 +111,35 @@ static bool apply_so_hooks_at_load_bias(pid_t pid,
     bool all_ok = true;
     for (auto &hp : state.hooks) {
         uint64_t target_addr = load_bias + hp.offset;
-        uint64_t patch = make_arm64_patch(hp.return_value);
 
-        if (ptrace(PTRACE_POKEDATA, pid, (void *)target_addr, (void *)patch) == 0) {
-            LOGI(TAG "so_hook: patched 0x%" PRIx64 " at 0x%" PRIx64 " -> return %d",
-                 hp.offset, target_addr, hp.return_value);
+        if (hp.branch_to != 0) {
+            // Generate ARM64 B (unconditional branch) to branch_to offset.
+            // B encoding: 0x14000000 | (imm26), where imm26 = (target - pc) / 4
+            int64_t rel = (int64_t)(hp.branch_to - hp.offset);
+            int32_t imm26 = (int32_t)(rel / 4) & 0x03FFFFFF;
+            uint32_t b_insn = 0x14000000 | (uint32_t)imm26;
+            uint32_t nop_insn = 0xD503201F;  // NOP (pad second word)
+            uint64_t patch = (uint64_t)nop_insn << 32 | b_insn;
+
+            if (ptrace(PTRACE_POKEDATA, pid, (void *)target_addr, (void *)patch) == 0) {
+                LOGI(TAG "so_hook: patched 0x%" PRIx64 " at 0x%" PRIx64 " -> B 0x%" PRIx64,
+                     hp.offset, target_addr, (uint64_t)(load_bias + hp.branch_to));
+            } else {
+                LOGE(TAG "so_hook: POKEDATA failed at 0x%" PRIx64 ": %s",
+                     target_addr, strerror(errno));
+                all_ok = false;
+            }
         } else {
-            LOGE(TAG "so_hook: POKEDATA failed at 0x%" PRIx64 ": %s",
-                 target_addr, strerror(errno));
-            all_ok = false;
+            uint64_t patch = make_arm64_patch(hp.return_value);
+
+            if (ptrace(PTRACE_POKEDATA, pid, (void *)target_addr, (void *)patch) == 0) {
+                LOGI(TAG "so_hook: patched 0x%" PRIx64 " at 0x%" PRIx64 " -> return %d",
+                     hp.offset, target_addr, hp.return_value);
+            } else {
+                LOGE(TAG "so_hook: POKEDATA failed at 0x%" PRIx64 ": %s",
+                     target_addr, strerror(errno));
+                all_ok = false;
+            }
         }
     }
 
@@ -1006,9 +1028,11 @@ static void capture_backtrace(pid_t pid, const tracer_regs &regs,
 // =========================================================================
 
 void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool verbose_logs,
+                          bool block_self_kill,
                           const std::vector<so_hook_config> &so_hooks) {
     g_target_pid = target_pid;
     g_verbose_logs = verbose_logs;
+    g_block_self_kill = block_self_kill;
     g_maps_stage_start_ms = now_ms();
     g_stat_total = g_stat_filtered = g_stat_logged = g_stat_tampered = 0;
     g_stat_last_report = now_ms();
@@ -1057,8 +1081,8 @@ void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool ve
             LOGE(TAG "failed to open log %s: %s",
                  log_path.c_str(), strerror(errno));
         } else {
-            fprintf(g_log_fp, "=== tracer started, target pid=%d ===\n",
-                    target_pid);
+            fprintf(g_log_fp, "=== tracer started, target pid=%d, block_self_kill=%d ===\n",
+                    target_pid, g_block_self_kill ? 1 : 0);
             fflush(g_log_fp);
         }
     }
@@ -1078,33 +1102,34 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
     // Fallback path for ROMs where linker does not close the SO fd.
     maybe_apply_so_hooks_fallback(pid, "seccomp-stop", false);
 
-    // ---- Intercept process-killing syscalls: log caller and block ----
+    // ---- Intercept process-killing syscalls: always log + backtrace ----
     if (nr == __NR_exit_group || nr == __NR_kill || nr == __NR_tgkill) {
         uint64_t pc = tracer_get_pc(regs);
         std::string caller = resolve_caller_cached(pid, pc);
+        const char *action = g_block_self_kill ? "BLOCKED" : "DETECTED";
 
         if (nr == __NR_exit_group) {
             uint64_t exit_code = tracer_get_arg(regs, 0);
-            LOGE(TAG "BLOCKED exit_group(%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
-                 (unsigned long long)exit_code, pid, pc, caller.c_str());
+            LOGE(TAG "%s exit_group(%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
+                 action, (unsigned long long)exit_code, pid, pc, caller.c_str());
         } else if (nr == __NR_kill) {
             uint64_t target_pid_arg = tracer_get_arg(regs, 0);
             uint64_t sig = tracer_get_arg(regs, 1);
-            LOGE(TAG "BLOCKED kill(pid=%llu, sig=%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
-                 (unsigned long long)target_pid_arg, (unsigned long long)sig,
+            LOGE(TAG "%s kill(pid=%llu, sig=%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
+                 action, (unsigned long long)target_pid_arg, (unsigned long long)sig,
                  pid, pc, caller.c_str());
         } else {
             uint64_t tgid_arg = tracer_get_arg(regs, 0);
             uint64_t tid_arg = tracer_get_arg(regs, 1);
             uint64_t sig = tracer_get_arg(regs, 2);
-            LOGE(TAG "BLOCKED tgkill(tgid=%llu, tid=%llu, sig=%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
-                 (unsigned long long)tgid_arg, (unsigned long long)tid_arg,
+            LOGE(TAG "%s tgkill(tgid=%llu, tid=%llu, sig=%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
+                 action, (unsigned long long)tgid_arg, (unsigned long long)tid_arg,
                  (unsigned long long)sig, pid, pc, caller.c_str());
         }
 
         if (g_log_fp) {
-            fprintf(g_log_fp, "[KILL_INTERCEPT] nr=%s pid=%d PC=0x%" PRIx64 " caller=%s args=[%llu,%llu,%llu]\n",
-                    syscall_name(nr), pid, pc, caller.c_str(),
+            fprintf(g_log_fp, "[KILL_INTERCEPT] %s nr=%s pid=%d PC=0x%" PRIx64 " caller=%s args=[%llu,%llu,%llu]\n",
+                    action, syscall_name(nr), pid, pc, caller.c_str(),
                     (unsigned long long)tracer_get_arg(regs, 0),
                     (unsigned long long)tracer_get_arg(regs, 1),
                     (unsigned long long)tracer_get_arg(regs, 2));
@@ -1114,9 +1139,12 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
         // Capture full stack backtrace for caller analysis
         capture_backtrace(pid, regs);
 
-        // Block the syscall by replacing nr with -1 (returns -ENOSYS)
-        tracer_set_syscall_nr(regs, (uint64_t)-1);
-        tracer_setregs(pid, regs);
+        if (g_block_self_kill) {
+            // Block the syscall by replacing nr with -1 (returns -ENOSYS)
+            tracer_set_syscall_nr(regs, (uint64_t)-1);
+            tracer_setregs(pid, regs);
+        }
+        // When not blocking, syscall proceeds normally after PTRACE_CONT
         return SECCOMP_ACT_CONTINUE;
     }
 
@@ -1671,6 +1699,24 @@ void handle_syscall_exit(pid_t pid) {
     }
 
     g_waiting_read_exit.erase(pid);
+}
+
+void handle_fatal_signal(pid_t pid, int sig, const tracer_regs &regs) {
+    uint64_t pc = tracer_get_pc(regs);
+    std::string caller = resolve_caller_cached(pid, pc);
+
+    LOGE(TAG "FATAL_SIGNAL: pid=%d sig=%d (%s) PC=0x%" PRIx64 " caller=%s",
+         pid, sig, strsignal(sig), pc, caller.c_str());
+
+    if (g_log_fp) {
+        fprintf(g_log_fp,
+                "[FATAL_SIGNAL] pid=%d sig=%d (%s) PC=0x%" PRIx64 " caller=%s\n",
+                pid, sig, strsignal(sig), pc, caller.c_str());
+        fflush(g_log_fp);
+    }
+
+    // Capture full stack backtrace
+    capture_backtrace(pid, regs);
 }
 
 void syscall_handler_fini() {

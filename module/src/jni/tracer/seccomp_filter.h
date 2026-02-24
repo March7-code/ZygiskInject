@@ -21,6 +21,7 @@ struct seccomp_bpf_program {
 seccomp_bpf_program build_seccomp_filter(const std::vector<uint32_t> &syscall_nrs);
 
 // Convenience: build filter for the default anti-cheat IO syscalls.
-seccomp_bpf_program build_default_io_filter();
+// When block_self_kill is true, also intercept exit_group/kill/tgkill.
+seccomp_bpf_program build_default_io_filter(bool block_self_kill = false);
 
 #endif // ZYGISKFRIDA_TRACER_SECCOMP_FILTER_H
