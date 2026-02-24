@@ -33,12 +33,15 @@ static constexpr long kPtraceOptions =
         PTRACE_O_TRACESYSGOOD;
 
 // ---------------------------------------------------------------------------
-// PTRACE_SEIZE all existing threads so the tracer receives their seccomp events.
-// Without this, threads that existed before PTRACE_SEIZE on the leader have the
-// seccomp filter (via TSYNC) but no tracer — the kernel silently returns -ENOSYS
-// for SECCOMP_RET_TRACE stops, so we never see the event or log the caller.
+// PTRACE_SEIZE existing threads so seccomp TRACE events are delivered to tracer.
+//
+// stage="pre-inject": seize before seccomp install to avoid a window where
+// sibling threads get SECCOMP_RET_TRACE but are not traced yet (kernel then
+// returns -ENOSYS with no PTRACE_EVENT_SECCOMP stop/log).
+//
+// stage="post-inject": catch threads created during the injection sequence.
 // ---------------------------------------------------------------------------
-static void seize_existing_threads(pid_t target_pid) {
+static void seize_existing_threads(pid_t target_pid, const char *stage) {
     char task_dir[64];
     snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", target_pid);
     DIR *dir = opendir(task_dir);
@@ -64,7 +67,8 @@ static void seize_existing_threads(pid_t target_pid) {
         }
     }
     closedir(dir);
-    LOGI(TAG "seize_existing_threads: seized %d sibling threads", seized);
+    LOGI(TAG "seize_existing_threads(%s): seized %d sibling threads",
+         stage, seized);
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +103,10 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
         _exit(1);
     }
 
+    // 2b. Seize siblings before installing seccomp filter.
+    // This closes the "SECCOMP_RET_TRACE but untraced thread" race window.
+    seize_existing_threads(target_pid, "pre-inject");
+
     // 3. Build and inject seccomp filter
     g_bpf = build_default_io_filter();
     LOGI(TAG "BPF filter: %zu instructions", g_bpf.size());
@@ -111,9 +119,8 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
     g_filter_injected.insert(target_pid);
     LOGI(TAG "seccomp filter injected, tsync_ok=%d", g_tsync_ok ? 1 : 0);
 
-    // 3b. PTRACE_SEIZE all existing sibling threads so we receive their
-    //     seccomp events (exit_group/kill/tgkill logging).
-    seize_existing_threads(target_pid);
+    // 3b. Catch any siblings created while we were injecting the filter.
+    seize_existing_threads(target_pid, "post-inject");
 
     // 4. Initialize syscall handler (opens log file)
     syscall_handler_init(target_pid, log_path, verbose_logs, so_hooks);

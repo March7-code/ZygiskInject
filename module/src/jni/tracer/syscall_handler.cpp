@@ -622,6 +622,24 @@ static uint64_t now_ms() {
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static bool ensure_dir_recursive(const std::string &dir) {
+    if (dir.empty()) return true;
+
+    size_t pos = (dir[0] == '/') ? 1 : 0;
+    while (pos <= dir.size()) {
+        size_t slash = dir.find('/', pos);
+        std::string cur = (slash == std::string::npos) ? dir : dir.substr(0, slash);
+        if (!cur.empty()) {
+            if (mkdir(cur.c_str(), 0755) < 0 && errno != EEXIST) {
+                return false;
+            }
+        }
+        if (slash == std::string::npos) break;
+        pos = slash + 1;
+    }
+    return true;
+}
+
 static void maybe_apply_so_hooks_fallback(pid_t pid, const char *reason, bool force) {
     if (g_all_so_hooks_done) return;
 
@@ -1026,9 +1044,13 @@ void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool ve
 
     if (!log_path.empty()) {
         // Ensure parent directory exists (tracer runs as root)
-        std::string dir = log_path.substr(0, log_path.rfind('/'));
-        if (!dir.empty()) {
-            mkdir(dir.c_str(), 0755);
+        size_t slash = log_path.rfind('/');
+        if (slash != std::string::npos) {
+            std::string dir = log_path.substr(0, slash);
+            if (!dir.empty() && !ensure_dir_recursive(dir)) {
+                LOGE(TAG "failed to create log dir %s: %s",
+                     dir.c_str(), strerror(errno));
+            }
         }
         g_log_fp = fopen(log_path.c_str(), "a");
         if (!g_log_fp) {
