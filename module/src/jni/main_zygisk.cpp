@@ -415,9 +415,29 @@ static void companion_handler(int client) {
             read_string(client, log_path);
             uint8_t tracer_verbose_logs = 0;
             read_u8(client, tracer_verbose_logs);
-            LOGI("[companion] launching tracer for pid %u, log=%s",
-                 target_pid, log_path.c_str());
-            launch_tracer((pid_t)target_pid, log_path, tracer_verbose_logs != 0);
+
+            // Read SO hook configs
+            std::vector<so_hook_config> so_hooks;
+            uint32_t num_so_hooks = 0;
+            if (read(client, &num_so_hooks, sizeof(num_so_hooks)) == sizeof(num_so_hooks)) {
+                for (uint32_t i = 0; i < num_so_hooks; i++) {
+                    so_hook_config shc;
+                    read_string(client, shc.so_name);
+                    uint32_t num_hooks = 0;
+                    read(client, &num_hooks, sizeof(num_hooks));
+                    for (uint32_t j = 0; j < num_hooks; j++) {
+                        hook_point hp{};
+                        read(client, &hp.offset, sizeof(hp.offset));
+                        read(client, &hp.return_value, sizeof(hp.return_value));
+                        shc.hooks.push_back(hp);
+                    }
+                    so_hooks.push_back(std::move(shc));
+                }
+            }
+
+            LOGI("[companion] launching tracer for pid %u, log=%s, so_hooks=%zu",
+                 target_pid, log_path.c_str(), so_hooks.size());
+            launch_tracer((pid_t)target_pid, log_path, tracer_verbose_logs != 0, so_hooks);
         }
     }
 #endif
@@ -529,13 +549,27 @@ class MyModule : public zygisk::ModuleBase {
         // The companion (root) will fork a tracer process that attaches
         // to our pid via ptrace. We send the request here in preAppSpecialize
         // because connectCompanion is only available at this stage.
+        // Auto-enable tracer if dobby_hooks are configured (needed for SO load-time patching).
 #if defined(__aarch64__)
-        if (cfg->tracer_mode == "probe") {
+        bool need_tracer = (cfg->tracer_mode == "probe") || !cfg->dobby_hooks.empty();
+        if (need_tracer) {
             write_string(sock, "probe");
             uint32_t my_pid = (uint32_t)getpid();
             ::write(sock, &my_pid, sizeof(my_pid));
             write_string(sock, cfg->tracer_log_path);
             write_u8(sock, cfg->tracer_verbose_logs ? 1 : 0);
+            // Send SO hook configs
+            uint32_t num_so_hooks = (uint32_t)cfg->dobby_hooks.size();
+            ::write(sock, &num_so_hooks, sizeof(num_so_hooks));
+            for (auto &shc : cfg->dobby_hooks) {
+                write_string(sock, shc.so_name);
+                uint32_t num_hooks = (uint32_t)shc.hooks.size();
+                ::write(sock, &num_hooks, sizeof(num_hooks));
+                for (auto &hp : shc.hooks) {
+                    ::write(sock, &hp.offset, sizeof(hp.offset));
+                    ::write(sock, &hp.return_value, sizeof(hp.return_value));
+                }
+            }
         } else {
             write_string(sock, "off");
         }

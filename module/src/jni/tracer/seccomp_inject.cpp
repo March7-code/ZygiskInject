@@ -7,6 +7,7 @@
 #include <limits>
 #include <vector>
 
+#include <dirent.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <signal.h>
@@ -268,8 +269,85 @@ static int inject_seccomp_filter_once(pid_t pid,
     return ok ? 0 : -1;
 }
 
-int inject_seccomp_filter(pid_t pid, const seccomp_bpf_program &prog) {
+// ---------------------------------------------------------------------------
+// Inject into a single already-stopped thread (no TSYNC).
+// ---------------------------------------------------------------------------
+int inject_seccomp_filter_thread(pid_t tid, const seccomp_bpf_program &prog) {
+    int64_t ret = 0;
+    if (inject_seccomp_filter_once(tid, prog, 0, &ret) < 0) {
+        LOGE(TAG "inject_seccomp_filter_thread: injection failed for tid %d", tid);
+        return -1;
+    }
+    if (ret != 0) {
+        LOGE(TAG "inject_seccomp_filter_thread: seccomp() returned %lld for tid %d",
+             (long long)ret, tid);
+        return -1;
+    }
+    LOGI(TAG "inject_seccomp_filter_thread: filter installed on tid %d", tid);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Enumerate /proc/<tgid>/task/ and inject filter into each sibling thread.
+// Caller must have already PTRACE_SEIZE'd the thread group leader.
+// Each sibling is PTRACE_INTERRUPT'd, injected, then PTRACE_CONT'd.
+// ---------------------------------------------------------------------------
+static void inject_into_existing_threads(pid_t tgid, const seccomp_bpf_program &prog) {
+    char task_dir[64];
+    snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", tgid);
+    DIR *dir = opendir(task_dir);
+    if (!dir) {
+        LOGW(TAG "cannot open %s: %s", task_dir, strerror(errno));
+        return;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (ent->d_name[0] == '.') continue;
+        pid_t tid = (pid_t)atoi(ent->d_name);
+        if (tid <= 0 || tid == tgid) continue;  // skip leader (already injected)
+
+        // PTRACE_SEIZE the sibling thread
+        if (ptrace(PTRACE_SEIZE, tid, nullptr,
+                   (void*)(uintptr_t)(PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD)) < 0) {
+            LOGW(TAG "PTRACE_SEIZE tid %d failed: %s (may already be traced)", tid, strerror(errno));
+            // Thread might already be auto-traced via PTRACE_O_TRACECLONE.
+            // Try PTRACE_INTERRUPT directly.
+        }
+
+        if (ptrace(PTRACE_INTERRUPT, tid, nullptr, nullptr) < 0) {
+            LOGW(TAG "PTRACE_INTERRUPT tid %d failed: %s", tid, strerror(errno));
+            continue;
+        }
+
+        int status = 0;
+        if (waitpid(tid, &status, __WALL) < 0) {
+            LOGW(TAG "waitpid tid %d failed: %s", tid, strerror(errno));
+            continue;
+        }
+
+        if (!WIFSTOPPED(status)) {
+            LOGW(TAG "tid %d not stopped after INTERRUPT (status=0x%x)", tid, status);
+            continue;
+        }
+
+        if (inject_seccomp_filter_thread(tid, prog) < 0) {
+            LOGW(TAG "filter injection failed for existing tid %d", tid);
+        }
+
+        ptrace(PTRACE_CONT, tid, nullptr, nullptr);
+    }
+    closedir(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Main entry: try TSYNC first, fall back to per-thread injection.
+// ---------------------------------------------------------------------------
+int inject_seccomp_filter(pid_t pid, const seccomp_bpf_program &prog,
+                          bool *tsync_ok) {
     const int64_t kRetUnavailable = std::numeric_limits<int64_t>::min();
+
+    if (tsync_ok) *tsync_ok = false;
 
     int64_t seccomp_ret = kRetUnavailable;
     if (inject_seccomp_filter_once(pid, prog, SECCOMP_FILTER_FLAG_TSYNC, &seccomp_ret) < 0) {
@@ -278,6 +356,7 @@ int inject_seccomp_filter(pid_t pid, const seccomp_bpf_program &prog) {
 
     if (seccomp_ret == 0) {
         LOGI(TAG "seccomp filter installed successfully (TSYNC)");
+        if (tsync_ok) *tsync_ok = true;
         return 0;
     }
 
@@ -285,13 +364,15 @@ int inject_seccomp_filter(pid_t pid, const seccomp_bpf_program &prog) {
         LOGW(TAG "seccomp(TSYNC) sync failed at tid=%lld; retrying without TSYNC",
              (long long)seccomp_ret);
 
+        // Install on the leader thread first.
         seccomp_ret = kRetUnavailable;
         if (inject_seccomp_filter_once(pid, prog, 0, &seccomp_ret) < 0) {
             return -1;
         }
 
         if (seccomp_ret == 0) {
-            LOGW(TAG "seccomp filter installed without TSYNC (thread-local fallback)");
+            LOGW(TAG "seccomp filter installed on leader tid %d; injecting into siblings", pid);
+            inject_into_existing_threads(pid, prog);
             return 0;
         }
     }

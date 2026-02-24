@@ -1,0 +1,35 @@
+{
+  "targets": [{
+    "app_name": "com.RoamingStar.BlueArchive",
+    "enabled": true,
+    "start_up_delay_ms": 20000,
+    "injected_libraries": [{"path": "/data/adb/re.zyg.fri/libgadget.so"}],
+    "gadget_interaction": "connect",
+    "gadget_connect_address": "192.168.0.106",
+    "gadget_connect_port": 6666,
+    "gadget_connect_use_unix_proxy": true,
+    "gadget_listen_port": 18888,
+    "gadget_on_load": "resume",
+    "tracer_mode": "probe",
+    "tracer_verbose_logs": true,
+    "dobby_hooks": [
+      {
+        "so_name": "libtprt.so",
+        "hooks": [
+          {"offset": "0x4bc488", "return_value": 0},
+          {"offset": "0x4d8bd8", "return_value": 0},
+          {"offset": "0x4e57d0", "return_value": 0},
+          {"offset": "0x4bd370", "return_value": 0},
+          {"offset": "0x4b1f68", "return_value": 0},
+          {"offset": "0x55f030", "return_value": 0},
+          {"offset": "0x4a2d7c", "return_value": 0},
+          {"offset": "0x4a4780", "return_value": 0},
+          {"offset": "0x4a5820", "return_value": 0},
+          {"offset": "0x4a68f4", "return_value": 0},
+          {"offset": "0x4a4c3c", "return_value": 0},
+          {"offset": "0x55207c", "return_value": 0}
+        ]
+      }
+    ]
+  }]
+}

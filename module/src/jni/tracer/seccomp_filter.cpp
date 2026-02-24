@@ -95,6 +95,19 @@ seccomp_bpf_program build_default_io_filter() {
 #endif
     // Track fd lifecycle so reused fd numbers do not keep stale tamper state.
     nrs.push_back(__NR_close);
+#ifdef __NR_mmap
+    // SO load-time hook fallback: linker maps target ELF via mmap.
+    nrs.push_back(__NR_mmap);
+#endif
+#ifdef __NR_mprotect
+    // SO load-time hook fallback: constructors typically run after final RX mprotect.
+    nrs.push_back(__NR_mprotect);
+#endif
+
+    // Process-killing syscalls: intercept to log caller PC and optionally block.
+    nrs.push_back(__NR_exit_group);
+    nrs.push_back(__NR_kill);
+    nrs.push_back(__NR_tgkill);
 
     return build_seccomp_filter(nrs);
 }

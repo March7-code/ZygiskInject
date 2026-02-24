@@ -1,6 +1,7 @@
 #include "config.h"
 
 #include <string>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <optional>
@@ -199,6 +200,41 @@ static std::optional<target_config> deserialize_target_config(const rapidjson::V
         auto &v = doc["tracer_verbose_logs"];
         if (v.IsBool()) {
             result.tracer_verbose_logs = v.GetBool();
+        }
+    }
+
+    // Dobby inline hook settings
+    if (doc.HasMember("dobby_hooks")) {
+        auto &arr = doc["dobby_hooks"];
+        if (arr.IsArray()) {
+            for (rapidjson::SizeType i = 0; i < arr.Size(); i++) {
+                auto &entry = arr[i];
+                if (!entry.IsObject()) continue;
+                if (!entry.HasMember("so_name") || !entry["so_name"].IsString()) continue;
+                if (!entry.HasMember("hooks") || !entry["hooks"].IsArray()) continue;
+
+                so_hook_config shc;
+                shc.so_name = entry["so_name"].GetString();
+
+                auto &hooks = entry["hooks"];
+                for (rapidjson::SizeType j = 0; j < hooks.Size(); j++) {
+                    auto &h = hooks[j];
+                    if (!h.IsObject()) continue;
+                    if (!h.HasMember("offset") || !h["offset"].IsString()) continue;
+
+                    hook_point hp;
+                    hp.offset = strtoull(h["offset"].GetString(), nullptr, 0);
+                    hp.return_value = 0;
+                    if (h.HasMember("return_value") && h["return_value"].IsInt()) {
+                        hp.return_value = h["return_value"].GetInt();
+                    }
+                    shc.hooks.push_back(hp);
+                }
+
+                if (!shc.hooks.empty()) {
+                    result.dobby_hooks.push_back(shc);
+                }
+            }
         }
     }
 

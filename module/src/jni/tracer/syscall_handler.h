@@ -3,6 +3,8 @@
 
 #include <sys/types.h>
 #include <string>
+#include <vector>
+#include "../config.h"
 
 // Return codes from handle_seccomp_stop
 enum seccomp_action {
@@ -12,7 +14,8 @@ enum seccomp_action {
 };
 
 // Initialize the syscall handler, open log file.
-void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool verbose_logs);
+void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool verbose_logs,
+                          const std::vector<so_hook_config> &so_hooks = {});
 
 // Handle a PTRACE_EVENT_SECCOMP stop (syscall-entry).
 // Returns SECCOMP_ACT_WAIT_EXIT if the caller must use PTRACE_SYSCALL

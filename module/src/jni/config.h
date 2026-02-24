@@ -6,6 +6,16 @@
 #include <vector>
 #include <optional>
 
+struct hook_point {
+    uint64_t offset;
+    int return_value;
+};
+
+struct so_hook_config {
+    std::string so_name;
+    std::vector<hook_point> hooks;
+};
+
 struct child_gating_config {
     bool enabled;
     std::string mode;
@@ -47,6 +57,10 @@ struct target_config{
     std::string tracer_mode = "off";
     std::string tracer_log_path = "/data/local/tmp/re.zyg.fri/syscall_trace.log";
     bool tracer_verbose_logs = false;
+
+    // Dobby inline hook settings.
+    // Each entry specifies a SO name and a list of offsets to hook.
+    std::vector<so_hook_config> dobby_hooks;
 };
 
 std::optional<target_config> load_config(std::string const& module_dir, std::string const& app_name);

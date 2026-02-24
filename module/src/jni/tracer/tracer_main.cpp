@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <set>
 #include <signal.h>
 #include <sys/ptrace.h>
@@ -19,6 +20,12 @@
 
 // Track pids waiting for syscall-exit stop (after PTRACE_SYSCALL)
 static std::set<pid_t> g_awaiting_exit;
+// Track threads that already have the seccomp filter injected
+static std::set<pid_t> g_filter_injected;
+// Whether TSYNC succeeded (if true, all threads inherit the filter automatically)
+static bool g_tsync_ok = false;
+// Cached BPF program for injecting into new threads
+static seccomp_bpf_program g_bpf;
 static constexpr long kPtraceOptions =
         PTRACE_O_TRACESECCOMP |
         PTRACE_O_TRACECLONE |
@@ -26,10 +33,46 @@ static constexpr long kPtraceOptions =
         PTRACE_O_TRACESYSGOOD;
 
 // ---------------------------------------------------------------------------
+// PTRACE_SEIZE all existing threads so the tracer receives their seccomp events.
+// Without this, threads that existed before PTRACE_SEIZE on the leader have the
+// seccomp filter (via TSYNC) but no tracer — the kernel silently returns -ENOSYS
+// for SECCOMP_RET_TRACE stops, so we never see the event or log the caller.
+// ---------------------------------------------------------------------------
+static void seize_existing_threads(pid_t target_pid) {
+    char task_dir[64];
+    snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", target_pid);
+    DIR *dir = opendir(task_dir);
+    if (!dir) {
+        LOGW(TAG "seize_existing_threads: cannot open %s: %s", task_dir, strerror(errno));
+        return;
+    }
+
+    int seized = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (ent->d_name[0] == '.') continue;
+        pid_t tid = (pid_t)atoi(ent->d_name);
+        if (tid <= 0 || tid == target_pid) continue;  // skip leader (already seized)
+
+        long r = ptrace(PTRACE_SEIZE, tid, nullptr,
+                        (void *)(uintptr_t)kPtraceOptions);
+        if (r == 0) {
+            seized++;
+            g_filter_injected.insert(tid);
+        } else {
+            LOGW(TAG "seize_existing_threads: SEIZE tid %d failed: %s", tid, strerror(errno));
+        }
+    }
+    closedir(dir);
+    LOGI(TAG "seize_existing_threads: seized %d sibling threads", seized);
+}
+
+// ---------------------------------------------------------------------------
 // Tracer process main logic (runs as root in a forked child)
 // ---------------------------------------------------------------------------
 
-static void tracer_process(pid_t target_pid, const std::string &log_path, bool verbose_logs) {
+static void tracer_process(pid_t target_pid, const std::string &log_path, bool verbose_logs,
+                           const std::vector<so_hook_config> &so_hooks) {
     LOGI(TAG "tracer started, target pid=%d, log=%s",
          target_pid, log_path.c_str());
 
@@ -57,17 +100,23 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
     }
 
     // 3. Build and inject seccomp filter
-    auto bpf = build_default_io_filter();
-    LOGI(TAG "BPF filter: %zu instructions", bpf.size());
+    g_bpf = build_default_io_filter();
+    LOGI(TAG "BPF filter: %zu instructions", g_bpf.size());
 
-    if (inject_seccomp_filter(target_pid, bpf) < 0) {
+    if (inject_seccomp_filter(target_pid, g_bpf, &g_tsync_ok) < 0) {
         LOGE(TAG "seccomp injection failed, detaching");
         ptrace(PTRACE_DETACH, target_pid, nullptr, nullptr);
         _exit(1);
     }
+    g_filter_injected.insert(target_pid);
+    LOGI(TAG "seccomp filter injected, tsync_ok=%d", g_tsync_ok ? 1 : 0);
+
+    // 3b. PTRACE_SEIZE all existing sibling threads so we receive their
+    //     seccomp events (exit_group/kill/tgkill logging).
+    seize_existing_threads(target_pid);
 
     // 4. Initialize syscall handler (opens log file)
-    syscall_handler_init(target_pid, log_path, verbose_logs);
+    syscall_handler_init(target_pid, log_path, verbose_logs, so_hooks);
 
     // 5. Resume target
     if (ptrace(PTRACE_CONT, target_pid, nullptr, nullptr) < 0) {
@@ -123,6 +172,28 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
             unsigned long new_pid = 0;
             ptrace(PTRACE_GETEVENTMSG, stopped_pid, nullptr, &new_pid);
             LOGI(TAG "new child %lu from pid %d", new_pid, stopped_pid);
+
+            // When TSYNC failed, new threads don't inherit our filter.
+            // Inject it before letting them run.
+            if (!g_tsync_ok && new_pid > 0 &&
+                g_filter_injected.find((pid_t)new_pid) == g_filter_injected.end()) {
+                // The new thread gets an initial SIGSTOP; wait for it.
+                int child_status = 0;
+                pid_t wp = waitpid((pid_t)new_pid, &child_status, __WALL);
+                if (wp == (pid_t)new_pid && WIFSTOPPED(child_status)) {
+                    if (inject_seccomp_filter_thread((pid_t)new_pid, g_bpf) == 0) {
+                        g_filter_injected.insert((pid_t)new_pid);
+                        LOGI(TAG "injected seccomp filter into new tid %lu", new_pid);
+                    } else {
+                        LOGW(TAG "failed to inject filter into new tid %lu", new_pid);
+                    }
+                    ptrace(PTRACE_CONT, (pid_t)new_pid, nullptr, nullptr);
+                } else {
+                    LOGW(TAG "waitpid for new tid %lu returned wp=%d status=0x%x",
+                         new_pid, wp, child_status);
+                }
+            }
+
             ptrace(PTRACE_CONT, stopped_pid, nullptr, nullptr);
             continue;
         }
@@ -156,7 +227,8 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
 // Public API: fork a tracer child process
 // ---------------------------------------------------------------------------
 
-pid_t launch_tracer(pid_t target_pid, const std::string &log_path, bool verbose_logs) {
+pid_t launch_tracer(pid_t target_pid, const std::string &log_path, bool verbose_logs,
+                    const std::vector<so_hook_config> &so_hooks) {
     pid_t child = fork();
     if (child < 0) {
         LOGE(TAG "fork failed: %s", strerror(errno));
@@ -165,7 +237,7 @@ pid_t launch_tracer(pid_t target_pid, const std::string &log_path, bool verbose_
     if (child == 0) {
         // In tracer child — detach from parent's session
         setsid();
-        tracer_process(target_pid, log_path, verbose_logs);
+        tracer_process(target_pid, log_path, verbose_logs, so_hooks);
         _exit(0);  // unreachable
     }
     LOGI(TAG "launched tracer pid=%d for target pid=%d", child, target_pid);

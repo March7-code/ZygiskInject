@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <sys/ptrace.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -24,6 +25,123 @@
 static FILE *g_log_fp = nullptr;
 static pid_t g_target_pid = 0;
 static bool g_verbose_logs = false;
+
+// =========================================================================
+// SO load-time hook: patch functions via ptrace before .init_array runs
+// =========================================================================
+// When the linker opens a target SO, we track the fd. On close(fd), the SO
+// is fully mmap'd but constructors haven't run yet. We read /proc/<pid>/maps
+// to find the base address, then PTRACE_POKEDATA to overwrite function
+// prologues with "MOV X0, #N; RET".
+
+struct so_hook_state {
+    std::string so_name;
+    std::vector<hook_point> hooks;
+    bool done = false;
+};
+static std::vector<so_hook_state> g_so_hooks;
+static bool g_all_so_hooks_done = false;
+static uint64_t g_last_so_hook_probe_ms = 0;
+// g_so_hook_fds declared after tracked_fd_key below
+
+static uint64_t make_arm64_patch(int return_value) {
+    // ARM64 little-endian: first 4 bytes = MOV X0, #imm; next 4 bytes = RET
+    uint32_t mov_insn;
+    if (return_value >= 0) {
+        // MOV X0, #return_value  (MOVZ X0, #imm, LSL #0)
+        mov_insn = 0xD2800000 | ((uint32_t)(return_value & 0xFFFF) << 5);
+    } else {
+        // MOV X0, #return_value  (MOVN X0, #~imm)
+        mov_insn = 0x92800000 | ((uint32_t)(~return_value & 0xFFFF) << 5);
+    }
+    uint32_t ret_insn = 0xD65F03C0;  // RET
+    return (uint64_t)ret_insn << 32 | mov_insn;
+}
+
+static uintptr_t find_so_load_bias_in_maps(pid_t pid, const char *so_name) {
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    FILE *fp = fopen(maps_path, "r");
+    if (!fp) return 0;
+
+    char line[512];
+    uintptr_t best_bias = 0;
+    bool have_any = false;
+    uintptr_t exec_bias = 0;
+    bool have_exec = false;
+    while (fgets(line, sizeof(line), fp)) {
+        if (!strstr(line, so_name)) continue;
+        uintptr_t start = 0;
+        uintptr_t end = 0;
+        char perms[5] = {0};
+        unsigned long long file_off = 0;
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s %llx",
+                   &start, &end, perms, &file_off) < 4) {
+            continue;
+        }
+
+        uintptr_t bias = start - (uintptr_t)file_off;
+        if (!have_any || bias < best_bias) {
+            best_bias = bias;
+            have_any = true;
+        }
+        if (strchr(perms, 'x')) {
+            exec_bias = bias;
+            have_exec = true;
+        }
+    }
+    fclose(fp);
+    if (have_exec) return exec_bias;
+    if (have_any) return best_bias;
+    return 0;
+}
+
+static bool apply_so_hooks_at_load_bias(pid_t pid,
+                                        size_t hook_idx,
+                                        uintptr_t load_bias,
+                                        const char *reason) {
+    so_hook_state &state = g_so_hooks[hook_idx];
+    if (state.done) return true;
+
+    LOGI(TAG "so_hook: %s loaded via %s, load_bias=0x%" PRIxPTR,
+         state.so_name.c_str(), reason, load_bias);
+
+    bool all_ok = true;
+    for (auto &hp : state.hooks) {
+        uint64_t target_addr = load_bias + hp.offset;
+        uint64_t patch = make_arm64_patch(hp.return_value);
+
+        if (ptrace(PTRACE_POKEDATA, pid, (void *)target_addr, (void *)patch) == 0) {
+            LOGI(TAG "so_hook: patched 0x%" PRIx64 " at 0x%" PRIx64 " -> return %d",
+                 hp.offset, target_addr, hp.return_value);
+        } else {
+            LOGE(TAG "so_hook: POKEDATA failed at 0x%" PRIx64 ": %s",
+                 target_addr, strerror(errno));
+            all_ok = false;
+        }
+    }
+
+    state.done = all_ok;
+    if (!all_ok) {
+        LOGW(TAG "so_hook: %s patch incomplete, will retry if SO is reopened",
+             state.so_name.c_str());
+    }
+    g_all_so_hooks_done = true;
+    for (auto &s : g_so_hooks) {
+        if (!s.done) { g_all_so_hooks_done = false; break; }
+    }
+    return all_ok;
+}
+
+static void apply_so_hooks_via_ptrace(pid_t pid, size_t hook_idx) {
+    so_hook_state &state = g_so_hooks[hook_idx];
+    uintptr_t load_bias = find_so_load_bias_in_maps(pid, state.so_name.c_str());
+    if (load_bias == 0) {
+        LOGW(TAG "so_hook: %s not found in maps yet", state.so_name.c_str());
+        return;
+    }
+    (void)apply_so_hooks_at_load_bias(pid, hook_idx, load_bias, "maps");
+}
 
 // Forward declarations
 static void refresh_maps_cache(pid_t pid);
@@ -53,23 +171,14 @@ struct tracked_fd_key {
 
 static std::map<pid_t, pid_t> g_tid_to_tgid_cache;
 
-static pid_t resolve_tracee_tgid(pid_t tid) {
-    auto it = g_tid_to_tgid_cache.find(tid);
-    if (it != g_tid_to_tgid_cache.end()) return it->second;
-
-    char status_path[64];
-    snprintf(status_path, sizeof(status_path), "/proc/%d/status", tid);
+static pid_t read_tgid_from_status_file(const char *status_path, pid_t fallback) {
     FILE *fp = fopen(status_path, "r");
-    if (!fp) {
-        g_tid_to_tgid_cache[tid] = tid;
-        return tid;
-    }
+    if (!fp) return 0;
 
     char line[256];
-    pid_t tgid = tid;
+    pid_t tgid = fallback;
     while (fgets(line, sizeof(line), fp)) {
         if (strncmp(line, "Tgid:", 5) == 0) {
-            // "Tgid:\t12345"
             int parsed = 0;
             if (sscanf(line + 5, "%d", &parsed) == 1 && parsed > 0) {
                 tgid = (pid_t)parsed;
@@ -78,6 +187,28 @@ static pid_t resolve_tracee_tgid(pid_t tid) {
         }
     }
     fclose(fp);
+    return tgid;
+}
+
+static pid_t resolve_tracee_tgid(pid_t tid) {
+    auto it = g_tid_to_tgid_cache.find(tid);
+    if (it != g_tid_to_tgid_cache.end()) return it->second;
+
+    char status_path[64];
+    snprintf(status_path, sizeof(status_path), "/proc/%d/status", tid);
+    pid_t tgid = read_tgid_from_status_file(status_path, tid);
+
+    // For non-leader threads, /proc/<tid>/status may not exist on Android.
+    // Try /proc/<target_pid>/task/<tid>/status as a fallback.
+    if (tgid == 0 && g_target_pid > 0 && tid != g_target_pid) {
+        snprintf(status_path, sizeof(status_path), "/proc/%d/task/%d/status",
+                 g_target_pid, tid);
+        tgid = read_tgid_from_status_file(status_path, tid);
+    }
+
+    if (tgid <= 0) {
+        tgid = tid;
+    }
 
     g_tid_to_tgid_cache[tid] = tgid;
     return tgid;
@@ -88,6 +219,58 @@ static inline tracked_fd_key make_fd_key(pid_t tid, uint64_t fd) {
 }
 
 static std::set<tracked_fd_key> g_status_fds;  // (tgid, fd) for proc status
+
+// SO hook fd tracking (declared here after tracked_fd_key is defined)
+static std::map<tracked_fd_key, size_t> g_so_hook_fds;  // fd -> index into g_so_hooks
+// Fallback index for cases where tgid resolution briefly fails on worker tids.
+static std::map<uint64_t, size_t> g_so_hook_fds_raw;    // fd -> index into g_so_hooks
+
+static std::string normalize_path_basename(const std::string &path) {
+    const char *base = strrchr(path.c_str(), '/');
+    base = base ? base + 1 : path.c_str();
+    std::string name(base);
+    static const std::string kDeletedSuffix = " (deleted)";
+    if (name.size() > kDeletedSuffix.size() &&
+        name.compare(name.size() - kDeletedSuffix.size(),
+                     kDeletedSuffix.size(), kDeletedSuffix) == 0) {
+        name.resize(name.size() - kDeletedSuffix.size());
+    }
+    return name;
+}
+
+static bool match_pending_so_hook_by_path(const std::string &path, size_t *out_idx) {
+    std::string basename = normalize_path_basename(path);
+    for (size_t i = 0; i < g_so_hooks.size(); i++) {
+        if (!g_so_hooks[i].done && g_so_hooks[i].so_name == basename) {
+            if (out_idx) *out_idx = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool lookup_so_hook_idx_by_fd(pid_t tid, uint64_t fd, size_t *out_idx) {
+    tracked_fd_key key = make_fd_key(tid, fd);
+    auto it = g_so_hook_fds.find(key);
+    if (it != g_so_hook_fds.end()) {
+        if (out_idx) *out_idx = it->second;
+        return true;
+    }
+
+    // Fallback to raw-fd map for cases where fd tracking crosses tids.
+    auto raw_it = g_so_hook_fds_raw.find(fd);
+    if (raw_it != g_so_hook_fds_raw.end()) {
+        if (out_idx) *out_idx = raw_it->second;
+        return true;
+    }
+    return false;
+}
+
+static void erase_so_hook_fd_tracking(pid_t tid, uint64_t fd) {
+    tracked_fd_key key = make_fd_key(tid, fd);
+    g_so_hook_fds.erase(key);
+    g_so_hook_fds_raw.erase(fd);
+}
 
 static bool is_proc_task_status_path(const std::string &path,
                                      const std::string &prefix) {
@@ -439,6 +622,22 @@ static uint64_t now_ms() {
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static void maybe_apply_so_hooks_fallback(pid_t pid, const char *reason, bool force) {
+    if (g_all_so_hooks_done) return;
+
+    uint64_t now = now_ms();
+    if (!force && (now - g_last_so_hook_probe_ms) < 15) return;
+    g_last_so_hook_probe_ms = now;
+
+    for (size_t i = 0; i < g_so_hooks.size(); i++) {
+        if (g_so_hooks[i].done) continue;
+        if (find_so_load_bias_in_maps(pid, g_so_hooks[i].so_name.c_str()) == 0) continue;
+        LOGI(TAG "so_hook: fallback trigger (%s), %s is in maps",
+             reason, g_so_hooks[i].so_name.c_str());
+        apply_so_hooks_via_ptrace(pid, i);
+    }
+}
+
 static void refresh_maps_cache(pid_t pid) {
     uint64_t now = now_ms();
     if (!g_maps_cache.empty() && (now - g_maps_cache_time) < 1000) return;
@@ -490,11 +689,18 @@ static const std::string& resolve_fd_cached(pid_t pid, uint64_t fd_val) {
     auto it = g_fd_cache.find(key);
     if (it != g_fd_cache.end()) return it->second;
 
-    char link_path[64];
+    char link_path[96];
     char target[256] = {0};
+    pid_t proc_pid = (key.tgid > 0) ? key.tgid : pid;
     snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%llu",
-             pid, (unsigned long long)fd_val);
+             proc_pid, (unsigned long long)fd_val);
     ssize_t len = readlink(link_path, target, sizeof(target) - 1);
+    if (len <= 0 && proc_pid != pid) {
+        // Fallback for rare cases where tgid resolution is stale.
+        snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%llu",
+                 pid, (unsigned long long)fd_val);
+        len = readlink(link_path, target, sizeof(target) - 1);
+    }
     if (len > 0) target[len] = '\0';
 
     g_fd_cache[key] = target;
@@ -655,6 +861,15 @@ static const char* syscall_name(uint64_t nr) {
         case __NR_pread64:    return "pread64";
 #endif
         case __NR_close:      return "close";
+#ifdef __NR_mmap
+        case __NR_mmap:       return "mmap";
+#endif
+#ifdef __NR_mprotect
+        case __NR_mprotect:   return "mprotect";
+#endif
+        case __NR_exit_group: return "exit_group";
+        case __NR_kill:       return "kill";
+        case __NR_tgkill:     return "tgkill";
         default:              return "unknown";
     }
 }
@@ -710,10 +925,70 @@ static void log_syscall(pid_t pid, const char *name,
 }
 
 // =========================================================================
+// ARM64 stack backtrace via FP (x29) chain + PTRACE_PEEKDATA
+// =========================================================================
+// ARM64 ABI: each frame has [FP+0]=prev_FP, [FP+8]=return_addr (LR saved)
+// We walk the chain to collect return addresses and resolve them via maps.
+static void capture_backtrace(pid_t pid, const tracer_regs &regs,
+                              int max_depth = 20) {
+    refresh_maps_cache(pid);
+
+    uint64_t pc = tracer_get_pc(regs);
+    uint64_t lr = regs.regs[30];  // x30 = LR
+    uint64_t fp = regs.regs[29];  // x29 = FP
+
+    LOGE(TAG "BACKTRACE pid=%d >>>", pid);
+    LOGE(TAG "  #00 PC 0x%" PRIx64 "  %s", pc, resolve_caller_cached(pid, pc).c_str());
+    LOGE(TAG "  #01 LR 0x%" PRIx64 "  %s", lr, resolve_caller_cached(pid, lr).c_str());
+
+    if (g_log_fp) {
+        fprintf(g_log_fp, "[BACKTRACE] pid=%d\n", pid);
+        fprintf(g_log_fp, "  #00 PC 0x%" PRIx64 "  %s\n", pc, resolve_caller_cached(pid, pc).c_str());
+        fprintf(g_log_fp, "  #01 LR 0x%" PRIx64 "  %s\n", lr, resolve_caller_cached(pid, lr).c_str());
+    }
+
+    // Walk FP chain
+    for (int i = 2; i < max_depth && fp != 0; i++) {
+        uint64_t clean_fp = fp & 0x00FFFFFFFFFFFFFFULL;  // untag
+        if (clean_fp < 0x1000 || (clean_fp & 7) != 0) break;  // invalid alignment
+
+        // Read [FP+0] = prev_fp, [FP+8] = return_addr
+        errno = 0;
+        long prev_fp_lo = ptrace(PTRACE_PEEKDATA, pid, (void *)clean_fp, nullptr);
+        if (errno != 0) break;
+        errno = 0;
+        long ret_addr_lo = ptrace(PTRACE_PEEKDATA, pid, (void *)(clean_fp + 8), nullptr);
+        if (errno != 0) break;
+
+        uint64_t prev_fp = (uint64_t)prev_fp_lo;
+        uint64_t ret_addr = (uint64_t)ret_addr_lo;
+
+        if (ret_addr == 0) break;
+
+        std::string sym = resolve_caller_cached(pid, ret_addr);
+        LOGE(TAG "  #%02d RA 0x%" PRIx64 "  %s", i, ret_addr, sym.c_str());
+        if (g_log_fp) {
+            fprintf(g_log_fp, "  #%02d RA 0x%" PRIx64 "  %s\n", i, ret_addr, sym.c_str());
+        }
+
+        // Detect loops or upward-growing stack (corruption)
+        if (prev_fp <= clean_fp && prev_fp != 0) break;
+        fp = prev_fp;
+    }
+
+    LOGE(TAG "BACKTRACE <<<");
+    if (g_log_fp) {
+        fprintf(g_log_fp, "[BACKTRACE] end\n");
+        fflush(g_log_fp);
+    }
+}
+
+// =========================================================================
 // Public API
 // =========================================================================
 
-void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool verbose_logs) {
+void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool verbose_logs,
+                          const std::vector<so_hook_config> &so_hooks) {
     g_target_pid = target_pid;
     g_verbose_logs = verbose_logs;
     g_maps_stage_start_ms = now_ms();
@@ -726,6 +1001,21 @@ void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool ve
     g_maps_fd_states.clear();
     g_waiting_read_exit.clear();
     g_pending_exit.clear();
+
+    // SO load-time hooks
+    g_so_hooks.clear();
+    g_so_hook_fds.clear();
+    g_so_hook_fds_raw.clear();
+    g_all_so_hooks_done = so_hooks.empty();
+    g_last_so_hook_probe_ms = 0;
+    for (auto &shc : so_hooks) {
+        so_hook_state state;
+        state.so_name = shc.so_name;
+        state.hooks = shc.hooks;
+        state.done = false;
+        g_so_hooks.push_back(std::move(state));
+        LOGI(TAG "so_hook: watching for %s (%zu hooks)", shc.so_name.c_str(), shc.hooks.size());
+    }
 
     // Default protected libraries for ELF checksum bypass.
     // These are the libraries that DetectFrida checks via memdisk compare.
@@ -763,12 +1053,98 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
 
     uint64_t nr = tracer_get_syscall_nr(regs);
 
-    // close() cleanup for tracked fds (maps/status).
-    // We only clean tracked fds on close-exit when ret == 0.
+    // Fallback path for ROMs where linker does not close the SO fd.
+    maybe_apply_so_hooks_fallback(pid, "seccomp-stop", false);
+
+    // ---- Intercept process-killing syscalls: log caller and block ----
+    if (nr == __NR_exit_group || nr == __NR_kill || nr == __NR_tgkill) {
+        uint64_t pc = tracer_get_pc(regs);
+        std::string caller = resolve_caller_cached(pid, pc);
+
+        if (nr == __NR_exit_group) {
+            uint64_t exit_code = tracer_get_arg(regs, 0);
+            LOGE(TAG "BLOCKED exit_group(%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
+                 (unsigned long long)exit_code, pid, pc, caller.c_str());
+        } else if (nr == __NR_kill) {
+            uint64_t target_pid_arg = tracer_get_arg(regs, 0);
+            uint64_t sig = tracer_get_arg(regs, 1);
+            LOGE(TAG "BLOCKED kill(pid=%llu, sig=%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
+                 (unsigned long long)target_pid_arg, (unsigned long long)sig,
+                 pid, pc, caller.c_str());
+        } else {
+            uint64_t tgid_arg = tracer_get_arg(regs, 0);
+            uint64_t tid_arg = tracer_get_arg(regs, 1);
+            uint64_t sig = tracer_get_arg(regs, 2);
+            LOGE(TAG "BLOCKED tgkill(tgid=%llu, tid=%llu, sig=%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
+                 (unsigned long long)tgid_arg, (unsigned long long)tid_arg,
+                 (unsigned long long)sig, pid, pc, caller.c_str());
+        }
+
+        if (g_log_fp) {
+            fprintf(g_log_fp, "[KILL_INTERCEPT] nr=%s pid=%d PC=0x%" PRIx64 " caller=%s args=[%llu,%llu,%llu]\n",
+                    syscall_name(nr), pid, pc, caller.c_str(),
+                    (unsigned long long)tracer_get_arg(regs, 0),
+                    (unsigned long long)tracer_get_arg(regs, 1),
+                    (unsigned long long)tracer_get_arg(regs, 2));
+            fflush(g_log_fp);
+        }
+
+        // Capture full stack backtrace for caller analysis
+        capture_backtrace(pid, regs);
+
+        // Block the syscall by replacing nr with -1 (returns -ENOSYS)
+        tracer_set_syscall_nr(regs, (uint64_t)-1);
+        tracer_setregs(pid, regs);
+        return SECCOMP_ACT_CONTINUE;
+    }
+
+    // For SO load-time hooks, wait mmap-exit when mmap(fd) uses a tracked so fd.
+#ifdef __NR_mmap
+    if (nr == __NR_mmap && !g_all_so_hooks_done) {
+        uint64_t fd_val = tracer_get_arg(regs, 4);
+        if (fd_val != (uint64_t)-1 && resolve_tracee_tgid(pid) == g_target_pid) {
+            if (lookup_so_hook_idx_by_fd(pid, fd_val, nullptr)) {
+                LOGI(TAG "so_hook: mmap(fd=%llu) pid=%d hit tracked so fd -> WAIT_EXIT",
+                     (unsigned long long)fd_val, pid);
+            } else {
+                const std::string &fd_path = resolve_fd_cached(pid, fd_val);
+                size_t idx = 0;
+                if (match_pending_so_hook_by_path(fd_path, &idx)) {
+                    tracked_fd_key key = make_fd_key(pid, fd_val);
+                    g_so_hook_fds[key] = idx;
+                    g_so_hook_fds_raw[fd_val] = idx;
+                    LOGI(TAG "so_hook: mmap(fd=%llu) resolved via fd-path=%s -> idx=%zu",
+                         (unsigned long long)fd_val, fd_path.c_str(), idx);
+                } else if (g_verbose_logs) {
+                    LOGI(TAG "so_hook: mmap(fd=%llu) pid=%d path=%s not target, but WAIT_EXIT for verification",
+                         (unsigned long long)fd_val, pid, fd_path.c_str());
+                }
+            }
+            g_waiting_read_exit.insert(pid);
+            remember_pending_exit(pid, regs);
+            return SECCOMP_ACT_WAIT_EXIT;
+        }
+    }
+#endif
+#ifdef __NR_mprotect
+    if (nr == __NR_mprotect && !g_all_so_hooks_done &&
+        resolve_tracee_tgid(pid) == g_target_pid) {
+        g_waiting_read_exit.insert(pid);
+        remember_pending_exit(pid, regs);
+        return SECCOMP_ACT_WAIT_EXIT;
+    }
+#endif
+
+    // close() cleanup for tracked fds (maps/status) and SO hook fds.
     if (nr == __NR_close) {
         uint64_t fd_val = tracer_get_arg(regs, 0);
         tracked_fd_key key = make_fd_key(pid, fd_val);
-        if (g_maps_fds.count(key) || g_status_fds.count(key)) {
+        bool is_maps = g_maps_fds.count(key) > 0;
+        bool is_status = g_status_fds.count(key) > 0;
+        bool is_so_hook = lookup_so_hook_idx_by_fd(pid, fd_val, nullptr);
+        if (is_maps || is_status || is_so_hook) {
+            LOGI(TAG "close(fd=%llu) pid=%d: maps=%d status=%d so_hook=%d -> WAIT_EXIT",
+                 (unsigned long long)fd_val, pid, is_maps, is_status, is_so_hook);
             g_waiting_read_exit.insert(pid);
             remember_pending_exit(pid, regs);
             return SECCOMP_ACT_WAIT_EXIT;
@@ -783,6 +1159,22 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
     // --- For openat: check if it opens maps/status files we may tamper ---
     if (nr == __NR_openat) {
         uint64_t path_addr = tracer_get_arg(regs, 1);
+
+        // SO load-time hook: check if this openat is for a target SO.
+        // We need WAIT_EXIT to get the fd and track it for close().
+        if (!g_all_so_hooks_done) {
+            std::string path = read_tracee_string(pid, path_addr);
+            std::string basename = normalize_path_basename(path);
+            for (size_t i = 0; i < g_so_hooks.size(); i++) {
+                if (!g_so_hooks[i].done && g_so_hooks[i].so_name == basename) {
+                    LOGI(TAG "so_hook: intercepted openat(%s)", path.c_str());
+                    g_waiting_read_exit.insert(pid);
+                    remember_pending_exit(pid, regs);
+                    return SECCOMP_ACT_WAIT_EXIT;
+                }
+            }
+        }
+
         char prefix[8] = {0};
         bool have_prefix = peek_prefix(pid, path_addr, prefix);
 
@@ -893,8 +1285,29 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
         return SECCOMP_ACT_CONTINUE;
     }
 
-    // --- Level-1 filter for other *at syscalls ---
-    if (nr != __NR_getdents64) {
+    // --- Level-1 filter ---
+    // getdents64 is fd-based; mmap/mprotect are non-path syscalls.
+    if (nr == __NR_getdents64) {
+        maybe_flush_fd_cache();
+        uint64_t fd_val = tracer_get_arg(regs, 0);
+        const std::string &fd_path = resolve_fd_cached(pid, fd_val);
+        if (fd_path.find("/proc/") == std::string::npos) {
+            g_stat_filtered++;
+            maybe_report_stats();
+            return SECCOMP_ACT_CONTINUE;
+        }
+    }
+#ifdef __NR_mmap
+    else if (nr == __NR_mmap) {
+        // No prefix filtering: mmap args are addr/len/prot/flags/fd/off.
+    }
+#endif
+#ifdef __NR_mprotect
+    else if (nr == __NR_mprotect) {
+        // No prefix filtering: mprotect args are addr/len/prot.
+    }
+#endif
+    else {
         uint64_t path_addr = tracer_get_arg(regs, 1);
         char prefix[8] = {0};
         if (peek_prefix(pid, path_addr, prefix)) {
@@ -903,15 +1316,6 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
                 maybe_report_stats();
                 return SECCOMP_ACT_CONTINUE;
             }
-        }
-    } else {
-        maybe_flush_fd_cache();
-        uint64_t fd_val = tracer_get_arg(regs, 0);
-        const std::string &fd_path = resolve_fd_cached(pid, fd_val);
-        if (fd_path.find("/proc/") == std::string::npos) {
-            g_stat_filtered++;
-            maybe_report_stats();
-            return SECCOMP_ACT_CONTINUE;
         }
     }
 
@@ -923,6 +1327,41 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
         uint64_t fd_val = tracer_get_arg(regs, 0);
         const std::string &fd_path = resolve_fd_cached(pid, fd_val);
         log_syscall(pid, "getdents64", fd_path.c_str(), caller.c_str());
+#ifdef __NR_mmap
+    } else if (nr == __NR_mmap) {
+        uint64_t fd_val = tracer_get_arg(regs, 4);
+        uint64_t prot = tracer_get_arg(regs, 2);
+        uint64_t off = tracer_get_arg(regs, 5);
+        char mmap_desc[192];
+        if (fd_val != (uint64_t)-1) {
+            const std::string &fd_path = resolve_fd_cached(pid, fd_val);
+            snprintf(mmap_desc, sizeof(mmap_desc),
+                     "fd=%lld prot=0x%llx off=0x%llx path=%s",
+                     (long long)fd_val,
+                     (unsigned long long)prot,
+                     (unsigned long long)off,
+                     fd_path.c_str());
+        } else {
+            snprintf(mmap_desc, sizeof(mmap_desc),
+                     "fd=%lld prot=0x%llx off=0x%llx",
+                     (long long)((int64_t)fd_val),
+                     (unsigned long long)prot,
+                     (unsigned long long)off);
+        }
+        log_syscall(pid, "mmap", mmap_desc, caller.c_str());
+#endif
+#ifdef __NR_mprotect
+    } else if (nr == __NR_mprotect) {
+        uint64_t addr = tracer_get_arg(regs, 0);
+        uint64_t len = tracer_get_arg(regs, 1);
+        uint64_t prot = tracer_get_arg(regs, 2);
+        char mp_desc[128];
+        snprintf(mp_desc, sizeof(mp_desc), "addr=0x%llx len=0x%llx prot=0x%llx",
+                 (unsigned long long)addr,
+                 (unsigned long long)len,
+                 (unsigned long long)prot);
+        log_syscall(pid, "mprotect", mp_desc, caller.c_str());
+#endif
     } else {
         uint64_t path_addr = tracer_get_arg(regs, 1);
         std::string path = read_tracee_string(pid, path_addr);
@@ -957,6 +1396,37 @@ void handle_syscall_exit(pid_t pid) {
     if (nr == __NR_close) {
         uint64_t fd_val = have_pending ? pending.args[0] : tracer_get_arg(regs, 0);
         tracked_fd_key key = make_fd_key(pid, fd_val);
+        size_t so_idx = 0;
+        bool have_so_idx = lookup_so_hook_idx_by_fd(pid, fd_val, &so_idx);
+
+        LOGI(TAG "close-exit: pid=%d fd=%llu ret=%lld so_hook_fds_count=%zu",
+             pid, (unsigned long long)fd_val, (long long)ret,
+             g_so_hook_fds.size() + g_so_hook_fds_raw.size());
+
+        // SO load-time hook: apply patches when target SO's fd is closed
+        // At this point the SO is mmap'd but .init_array hasn't run yet
+        if (have_so_idx) {
+            LOGI(TAG "so_hook: close(fd=%llu) matched hook_idx=%zu, ret=%lld, done=%d",
+                 (unsigned long long)fd_val, so_idx, (long long)ret,
+                 (so_idx < g_so_hooks.size()) ? g_so_hooks[so_idx].done : -1);
+            if (ret == 0 && so_idx < g_so_hooks.size() && !g_so_hooks[so_idx].done) {
+                apply_so_hooks_via_ptrace(pid, so_idx);
+            }
+            if (ret == 0) erase_so_hook_fd_tracking(pid, fd_val);
+        } else {
+            LOGI(TAG "close-exit: fd=%llu NOT in tracked so fds (tgid=%d)",
+                 (unsigned long long)fd_val, key.tgid);
+            // Dump all tracked so_hook_fds for debugging
+            for (auto &entry : g_so_hook_fds) {
+                LOGI(TAG "  g_so_hook_fds entry: tgid=%d fd=%llu -> idx=%zu",
+                     entry.first.tgid, (unsigned long long)entry.first.fd, entry.second);
+            }
+            for (auto &entry : g_so_hook_fds_raw) {
+                LOGI(TAG "  g_so_hook_fds_raw entry: fd=%llu -> idx=%zu",
+                     (unsigned long long)entry.first, entry.second);
+            }
+        }
+
         if (ret == 0) {
             g_maps_fds.erase(key);
             g_maps_fd_states.erase(key);
@@ -966,13 +1436,45 @@ void handle_syscall_exit(pid_t pid) {
     } else if (nr == __NR_openat) {
         if (ret >= 0) {
             // Resolve what path was opened via /proc/<pid>/fd/<fd>
-            char link_path[64], target[256] = {0};
+            uint64_t opened_fd = (uint64_t)ret;
+            tracked_fd_key open_key = make_fd_key(pid, opened_fd);
+            pid_t proc_pid = (open_key.tgid > 0) ? open_key.tgid : pid;
+            char link_path[96], target[256] = {0};
             snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%lld",
-                     pid, (long long)ret);
+                     proc_pid, (long long)ret);
             ssize_t len = readlink(link_path, target, sizeof(target) - 1);
+            if (len <= 0 && proc_pid != pid) {
+                snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%lld",
+                         pid, (long long)ret);
+                len = readlink(link_path, target, sizeof(target) - 1);
+            }
+            std::string path_str;
             if (len > 0) {
                 target[len] = '\0';
-                std::string path_str(target);
+                path_str = target;
+            } else if (have_pending) {
+                // readlink may fail on some tid paths; fall back to original openat arg.
+                path_str = read_tracee_string(pid, pending.args[1]);
+            }
+
+            if (!path_str.empty() && path_str != "<?>") {
+                // SO load-time hook: track fd for target SOs
+                if (!g_all_so_hooks_done) {
+                    std::string basename = normalize_path_basename(path_str);
+                    for (size_t i = 0; i < g_so_hooks.size(); i++) {
+                        if (!g_so_hooks[i].done && g_so_hooks[i].so_name == basename) {
+                            uint64_t fd_val = (uint64_t)ret;
+                            tracked_fd_key key = make_fd_key(pid, fd_val);
+                            g_so_hook_fds[key] = i;
+                            g_so_hook_fds_raw[fd_val] = i;
+                            LOGI(TAG "so_hook: openat(%s) -> fd=%lld, tracking for close() [pid=%d tgid=%d]",
+                                 path_str.c_str(), (long long)ret, pid, key.tgid);
+                            break;
+                        }
+                    }
+                    maybe_apply_so_hooks_fallback(pid, "openat-exit", true);
+                }
+
                 if (is_proc_maps_path(path_str)) {
                     uint64_t fd_val = (uint64_t)ret;
                     tracked_fd_key key = make_fd_key(pid, fd_val);
@@ -999,7 +1501,7 @@ void handle_syscall_exit(pid_t pid) {
                     if (g_verbose_logs && g_log_fp) {
                         fprintf(g_log_fp,
                                 "[maps_bypass] tracking maps fd=%lld -> %s (enabled=%d)\n",
-                                (long long)ret, target,
+                                (long long)ret, path_str.c_str(),
                                 g_maps_fd_states[key].tamper_enabled ? 1 : 0);
                         fflush(g_log_fp);
                     }
@@ -1012,7 +1514,7 @@ void handle_syscall_exit(pid_t pid) {
                     }
                 }
             } else {
-                // Fallback: couldn't readlink, try status fd tracking
+                // Final fallback: keep status tracking behavior for legacy logic.
                 tracked_fd_key key = make_fd_key(pid, (uint64_t)ret);
                 g_status_fds.insert(key);
                 if (g_verbose_logs) {
@@ -1021,7 +1523,71 @@ void handle_syscall_exit(pid_t pid) {
                 }
             }
         }
-    } else if (nr == __NR_read
+    }
+#ifdef __NR_mmap
+    else if (nr == __NR_mmap) {
+        if (!g_all_so_hooks_done && ret > 0) {
+            uint64_t fd_val = have_pending ? pending.args[4] : tracer_get_arg(regs, 4);
+            size_t idx = 0;
+            bool matched = false;
+            std::string fd_path;
+            if (lookup_so_hook_idx_by_fd(pid, fd_val, &idx)) {
+                matched = true;
+            } else if (fd_val != (uint64_t)-1) {
+                fd_path = resolve_fd_cached(pid, fd_val);
+                if (match_pending_so_hook_by_path(fd_path, &idx)) {
+                    matched = true;
+                    tracked_fd_key key = make_fd_key(pid, fd_val);
+                    g_so_hook_fds[key] = idx;
+                    g_so_hook_fds_raw[fd_val] = idx;
+                }
+            }
+            if (matched) {
+                uint64_t prot = have_pending ? pending.args[2] : tracer_get_arg(regs, 2);
+                uint64_t map_off = have_pending ? pending.args[5] : tracer_get_arg(regs, 5);
+                uintptr_t map_addr = (uintptr_t)ret;
+                uintptr_t load_bias = map_addr - (uintptr_t)map_off;
+
+                LOGI(TAG "so_hook: mmap-exit fd=%llu addr=0x%" PRIxPTR
+                         " off=0x%" PRIx64 " prot=0x%" PRIx64 " path=%s -> load_bias=0x%" PRIxPTR,
+                     (unsigned long long)fd_val, map_addr, map_off, prot,
+                     fd_path.empty() ? "?" : fd_path.c_str(), load_bias);
+
+                if ((prot & PROT_EXEC) != 0) {
+                    bool patched = (idx < g_so_hooks.size()) &&
+                                   apply_so_hooks_at_load_bias(pid, idx, load_bias, "mmap-exec");
+                    if (patched) {
+                        erase_so_hook_fd_tracking(pid, fd_val);
+                    }
+                }
+            } else if (g_verbose_logs && fd_val != (uint64_t)-1 &&
+                       resolve_tracee_tgid(pid) == g_target_pid) {
+                const std::string &unmatched_path = resolve_fd_cached(pid, fd_val);
+                LOGI(TAG "so_hook: mmap-exit fd=%llu path=%s not matched",
+                     (unsigned long long)fd_val, unmatched_path.c_str());
+            }
+        }
+        if (!g_all_so_hooks_done) {
+            maybe_apply_so_hooks_fallback(pid, "mmap-exit", true);
+        }
+    }
+#endif
+#ifdef __NR_mprotect
+    else if (nr == __NR_mprotect) {
+        if (!g_all_so_hooks_done && ret == 0 && resolve_tracee_tgid(pid) == g_target_pid) {
+            uint64_t addr = have_pending ? pending.args[0] : tracer_get_arg(regs, 0);
+            uint64_t len = have_pending ? pending.args[1] : tracer_get_arg(regs, 1);
+            uint64_t prot = have_pending ? pending.args[2] : tracer_get_arg(regs, 2);
+            if ((prot & PROT_EXEC) != 0) {
+                LOGI(TAG "so_hook: mprotect-exit addr=0x%" PRIx64
+                         " len=0x%" PRIx64 " prot=0x%" PRIx64 " -> try patch",
+                     addr, len, prot);
+                maybe_apply_so_hooks_fallback(pid, "mprotect-exit", true);
+            }
+        }
+    }
+#endif
+    else if (nr == __NR_read
 #ifdef __NR_pread64
                || nr == __NR_pread64
 #endif
@@ -1104,4 +1670,8 @@ void syscall_handler_fini() {
     g_tid_to_tgid_cache.clear();
     g_pending_exit.clear();
     g_protected_libs.clear();
+    g_so_hooks.clear();
+    g_so_hook_fds.clear();
+    g_so_hook_fds_raw.clear();
+    g_last_so_hook_probe_ms = 0;
 }
