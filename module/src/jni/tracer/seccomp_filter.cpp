@@ -108,9 +108,24 @@ seccomp_bpf_program build_default_io_filter(bool block_self_kill) {
     // SECCOMP_RET_TRACE on untraced threads causes the kernel to return -ENOSYS,
     // which silently blocks the syscall and can cause the app to hang.
     if (block_self_kill) {
+#ifdef __NR_exit
+        nrs.push_back(__NR_exit);
+#endif
         nrs.push_back(__NR_exit_group);
         nrs.push_back(__NR_kill);
+#ifdef __NR_tkill
+        nrs.push_back(__NR_tkill);
+#endif
         nrs.push_back(__NR_tgkill);
+#ifdef __NR_rt_sigqueueinfo
+        nrs.push_back(__NR_rt_sigqueueinfo);
+#endif
+#ifdef __NR_rt_tgsigqueueinfo
+        nrs.push_back(__NR_rt_tgsigqueueinfo);
+#endif
+#ifdef __NR_pidfd_send_signal
+        nrs.push_back(__NR_pidfd_send_signal);
+#endif
     }
 
     return build_seccomp_filter(nrs);

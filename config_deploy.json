@@ -16,18 +16,7 @@
       {
         "so_name": "libtprt.so",
         "hooks": [
-          {"offset": "0x4bc488", "return_value": 0},
-          {"offset": "0x4d8bd8", "return_value": 0},
-          {"offset": "0x4e57d0", "return_value": 0},
-          {"offset": "0x4bd370", "return_value": 0},
-          {"offset": "0x4b1f68", "return_value": 0},
-          {"offset": "0x55f030", "return_value": 0},
-          {"offset": "0x4a2d7c", "return_value": 0},
-          {"offset": "0x4a4780", "return_value": 0},
-          {"offset": "0x4a5820", "return_value": 0},
-          {"offset": "0x4a68f4", "return_value": 0},
-          {"offset": "0x4a4c3c", "return_value": 0},
-          {"offset": "0x55207c", "return_value": 0}
+          {"offset": "0x163c10", "return_value": -1}
         ]
       }
     ]

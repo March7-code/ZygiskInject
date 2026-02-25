@@ -1,5 +1,6 @@
 #include "syscall_handler.h"
 #include "arch.h"
+#include "seccomp_inject.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -39,12 +40,31 @@ static bool g_block_self_kill = false;
 struct so_hook_state {
     std::string so_name;
     std::vector<hook_point> hooks;
+    std::vector<uint64_t> patched_words;
+    uintptr_t load_bias = 0;
     bool done = false;
 };
 static std::vector<so_hook_state> g_so_hooks;
 static bool g_all_so_hooks_done = false;
 static uint64_t g_last_so_hook_probe_ms = 0;
+static uint64_t g_last_so_hook_verify_ms = 0;
 // g_so_hook_fds declared after tracked_fd_key below
+
+static constexpr uint64_t kStaticImageBase = 0x400000ULL;
+
+static inline uint64_t normalize_hook_offset(uint64_t value) {
+    // Accept both file offsets (preferred) and static VA-style addresses
+    // from RE tools that include image base (e.g. 0x400000 + off).
+    return (value >= kStaticImageBase) ? (value - kStaticImageBase) : value;
+}
+
+static bool ptrace_read_word(pid_t pid, uint64_t addr, uint64_t &out_word) {
+    errno = 0;
+    long word = ptrace(PTRACE_PEEKDATA, pid, (void *)addr, nullptr);
+    if (errno != 0) return false;
+    out_word = (uint64_t)word;
+    return true;
+}
 
 static uint64_t make_arm64_patch(int return_value) {
     // ARM64 little-endian: first 4 bytes = MOV X0, #imm; next 4 bytes = RET
@@ -58,6 +78,43 @@ static uint64_t make_arm64_patch(int return_value) {
     }
     uint32_t ret_insn = 0xD65F03C0;  // RET
     return (uint64_t)ret_insn << 32 | mov_insn;
+}
+
+static bool make_arm64_branch_patch(uint64_t from_off, uint64_t to_off,
+                                    uint64_t *out_patch, int64_t *out_rel = nullptr) {
+    int64_t rel = (int64_t)to_off - (int64_t)from_off;
+    if (out_rel) *out_rel = rel;
+    // ARM64 B uses imm26 signed branch offset in units of 4 bytes.
+    if ((rel & 0x3) != 0 || rel < -(1LL << 27) || rel > ((1LL << 27) - 4)) {
+        return false;
+    }
+    int64_t imm26 = rel >> 2;
+    uint32_t b_insn = 0x14000000 | ((uint32_t)imm26 & 0x03FFFFFF);
+    uint32_t nop_insn = 0xD503201F;  // NOP (pad second word)
+    if (out_patch) {
+        *out_patch = ((uint64_t)nop_insn << 32) | b_insn;
+    }
+    return true;
+}
+
+static bool build_hook_patch_word(const hook_point &hp,
+                                  uint64_t *out_hook_off,
+                                  uint64_t *out_patch,
+                                  uint64_t *out_branch_off = nullptr,
+                                  int64_t *out_rel = nullptr) {
+    uint64_t hook_off = normalize_hook_offset(hp.offset);
+    if (out_hook_off) *out_hook_off = hook_off;
+
+    if (hp.branch_to != 0) {
+        uint64_t branch_off = normalize_hook_offset(hp.branch_to);
+        if (out_branch_off) *out_branch_off = branch_off;
+        return make_arm64_branch_patch(hook_off, branch_off, out_patch, out_rel);
+    }
+
+    if (out_branch_off) *out_branch_off = 0;
+    if (out_patch) *out_patch = make_arm64_patch(hp.return_value);
+    if (out_rel) *out_rel = 0;
+    return true;
 }
 
 static uintptr_t find_so_load_bias_in_maps(pid_t pid, const char *so_name) {
@@ -104,48 +161,141 @@ static bool apply_so_hooks_at_load_bias(pid_t pid,
                                         const char *reason) {
     so_hook_state &state = g_so_hooks[hook_idx];
     if (state.done) return true;
+    state.load_bias = load_bias;
+    if (state.patched_words.size() != state.hooks.size()) {
+        state.patched_words.assign(state.hooks.size(), 0);
+    }
 
     LOGI(TAG "so_hook: %s loaded via %s, load_bias=0x%" PRIxPTR,
          state.so_name.c_str(), reason, load_bias);
 
     bool all_ok = true;
-    for (auto &hp : state.hooks) {
-        uint64_t target_addr = load_bias + hp.offset;
+    for (size_t i = 0; i < state.hooks.size(); i++) {
+        const hook_point &hp = state.hooks[i];
+        state.patched_words[i] = 0;
+
+        uint64_t hook_off = 0;
+        uint64_t branch_off = 0;
+        uint64_t patch = 0;
+        int64_t rel = 0;
+        bool patch_meta_ok = build_hook_patch_word(hp, &hook_off, &patch, &branch_off, &rel);
+        uint64_t target_addr = load_bias + hook_off;
+
+        if (hook_off != hp.offset || (hp.branch_to != 0 && branch_off != hp.branch_to)) {
+            LOGI(TAG "so_hook: normalized offsets offset=0x%" PRIx64 "->0x%" PRIx64
+                     " branch_to=0x%" PRIx64 "->0x%" PRIx64,
+                 hp.offset, hook_off, hp.branch_to, branch_off);
+        }
+
+        if (!patch_meta_ok) {
+            LOGE(TAG "so_hook: invalid branch offset rel=0x%" PRIx64
+                     " (from=0x%" PRIx64 " to=0x%" PRIx64 ")",
+                 (uint64_t)rel, hook_off, branch_off);
+            all_ok = false;
+            continue;
+        }
+
+        uint64_t old_word = 0;
+        if (!ptrace_read_word(pid, target_addr, old_word)) {
+            LOGW(TAG "so_hook: pre-read failed at 0x%" PRIx64 ": %s",
+                 target_addr, strerror(errno));
+        } else {
+            LOGI(TAG "so_hook: pre-read 0x%" PRIx64 " (static 0x%" PRIx64 ") at 0x%" PRIx64
+                     " = 0x%" PRIx64,
+                 hook_off, hook_off + kStaticImageBase, target_addr, old_word);
+        }
+
+        // Safety guard: if the page content is all zeros, the linker hasn't
+        // filled the .text segment yet (demand-paged or pread pending).
+        // Skip this hook and retry later at the next trigger point.
+        if (old_word == 0) {
+            LOGW(TAG "so_hook: target 0x%" PRIx64 " is zero — page not loaded yet, deferring",
+                 target_addr);
+            all_ok = false;
+            continue;
+        }
+
+        // If already patched (e.g. retry after partial success), skip.
+        if (old_word == patch) {
+            LOGI(TAG "so_hook: target 0x%" PRIx64 " already patched, skipping",
+                 target_addr);
+            state.patched_words[i] = patch;
+            continue;
+        }
+
+        // The target page is r-xp.  We need to:
+        //   1. remote mprotect(page, 4096, rwx)  — make page writable in-place
+        //   2. PTRACE_POKEDATA                   — write patch (page is now rw)
+        //   3. remote mprotect(page, 4096, rx)   — restore; kernel flushes I-cache
+        //
+        // The remote mprotect is executed via ptrace trampoline (svc+brk).
+        // The svc will trigger a PTRACE_EVENT_SECCOMP stop because __NR_mprotect
+        // is in our BPF filter; run_remote_syscall now transparently passes
+        // through that stop and waits for the brk SIGTRAP.
+        static constexpr uint64_t kPageSize = 4096;
+        uint64_t page_addr = target_addr & ~(kPageSize - 1);
+
+        int64_t mp_ret = 0;
+        if (!ptrace_remote_syscall(pid, __NR_mprotect,
+                                   page_addr, kPageSize,
+                                   PROT_READ | PROT_WRITE | PROT_EXEC,
+                                   0, 0, 0, mp_ret) || mp_ret != 0) {
+            LOGE(TAG "so_hook: remote mprotect(rwx) failed at 0x%" PRIx64
+                     " ret=%lld: %s",
+                 page_addr, (long long)mp_ret, strerror(errno));
+            all_ok = false;
+            continue;
+        }
+
+        bool poke_ok =
+            (ptrace(PTRACE_POKEDATA, pid, (void *)target_addr, (void *)patch) == 0);
+
+        // Always restore rx, even if poke failed
+        int64_t mp_ret2 = 0;
+        if (!ptrace_remote_syscall(pid, __NR_mprotect,
+                                   page_addr, kPageSize,
+                                   PROT_READ | PROT_EXEC,
+                                   0, 0, 0, mp_ret2) || mp_ret2 != 0) {
+            LOGW(TAG "so_hook: remote mprotect(rx) failed at 0x%" PRIx64
+                     " ret=%lld (non-fatal)",
+                 page_addr, (long long)mp_ret2);
+        }
+
+        if (!poke_ok) {
+            LOGE(TAG "so_hook: POKEDATA failed at 0x%" PRIx64 ": %s",
+                 target_addr, strerror(errno));
+            all_ok = false;
+            continue;
+        }
+
+        uint64_t verify = 0;
+        if (!ptrace_read_word(pid, target_addr, verify) || verify != patch) {
+            LOGE(TAG "so_hook: verify failed at 0x%" PRIx64
+                     " expected=0x%" PRIx64 " got=0x%" PRIx64,
+                 target_addr, patch, verify);
+            all_ok = false;
+            continue;
+        }
+        state.patched_words[i] = patch;
 
         if (hp.branch_to != 0) {
-            // Generate ARM64 B (unconditional branch) to branch_to offset.
-            // B encoding: 0x14000000 | (imm26), where imm26 = (target - pc) / 4
-            int64_t rel = (int64_t)(hp.branch_to - hp.offset);
-            int32_t imm26 = (int32_t)(rel / 4) & 0x03FFFFFF;
-            uint32_t b_insn = 0x14000000 | (uint32_t)imm26;
-            uint32_t nop_insn = 0xD503201F;  // NOP (pad second word)
-            uint64_t patch = (uint64_t)nop_insn << 32 | b_insn;
-
-            if (ptrace(PTRACE_POKEDATA, pid, (void *)target_addr, (void *)patch) == 0) {
-                LOGI(TAG "so_hook: patched 0x%" PRIx64 " at 0x%" PRIx64 " -> B 0x%" PRIx64,
-                     hp.offset, target_addr, (uint64_t)(load_bias + hp.branch_to));
-            } else {
-                LOGE(TAG "so_hook: POKEDATA failed at 0x%" PRIx64 ": %s",
-                     target_addr, strerror(errno));
-                all_ok = false;
-            }
+            LOGI(TAG "so_hook: patched 0x%" PRIx64 " (static 0x%" PRIx64 ") at 0x%" PRIx64
+                     " -> B 0x%" PRIx64 " (static 0x%" PRIx64 ")"
+                     " old=0x%" PRIx64 " new=0x%" PRIx64,
+                 hook_off, hook_off + kStaticImageBase, target_addr,
+                 load_bias + branch_off, branch_off + kStaticImageBase,
+                 old_word, patch);
         } else {
-            uint64_t patch = make_arm64_patch(hp.return_value);
-
-            if (ptrace(PTRACE_POKEDATA, pid, (void *)target_addr, (void *)patch) == 0) {
-                LOGI(TAG "so_hook: patched 0x%" PRIx64 " at 0x%" PRIx64 " -> return %d",
-                     hp.offset, target_addr, hp.return_value);
-            } else {
-                LOGE(TAG "so_hook: POKEDATA failed at 0x%" PRIx64 ": %s",
-                     target_addr, strerror(errno));
-                all_ok = false;
-            }
+            LOGI(TAG "so_hook: patched 0x%" PRIx64 " (static 0x%" PRIx64 ") at 0x%" PRIx64
+                     " -> return %d old=0x%" PRIx64 " new=0x%" PRIx64,
+                 hook_off, hook_off + kStaticImageBase, target_addr,
+                 hp.return_value, old_word, patch);
         }
     }
 
     state.done = all_ok;
     if (!all_ok) {
-        LOGW(TAG "so_hook: %s patch incomplete, will retry if SO is reopened",
+        LOGW(TAG "so_hook: %s patch incomplete, will retry at next mprotect-exit",
              state.so_name.c_str());
     }
     g_all_so_hooks_done = true;
@@ -632,6 +782,7 @@ static bool is_interesting_prefix(const char prefix[8]) {
 struct maps_entry {
     uint64_t start;
     uint64_t end;
+    uint64_t file_off;
     char name[256];
 };
 
@@ -678,6 +829,59 @@ static void maybe_apply_so_hooks_fallback(pid_t pid, const char *reason, bool fo
     }
 }
 
+static void maybe_verify_so_hooks_integrity(pid_t pid, const char *reason, bool force) {
+    if (g_so_hooks.empty()) return;
+
+    uint64_t now = now_ms();
+    if (!force && (now - g_last_so_hook_verify_ms) < 250) return;
+    g_last_so_hook_verify_ms = now;
+
+    for (size_t i = 0; i < g_so_hooks.size(); i++) {
+        so_hook_state &state = g_so_hooks[i];
+        if (state.load_bias == 0 || state.patched_words.empty()) continue;
+
+        for (size_t j = 0; j < state.hooks.size() && j < state.patched_words.size(); j++) {
+            uint64_t expected = state.patched_words[j];
+            if (expected == 0) continue;
+
+            uint64_t hook_off = normalize_hook_offset(state.hooks[j].offset);
+            uint64_t target_addr = state.load_bias + hook_off;
+
+            uint64_t current = 0;
+            if (!ptrace_read_word(pid, target_addr, current)) {
+                LOGW(TAG "so_hook: verify-read failed (%s) %s off=0x%" PRIx64
+                         " addr=0x%" PRIx64 ": %s",
+                     reason, state.so_name.c_str(), hook_off, target_addr, strerror(errno));
+                continue;
+            }
+            if (current == expected) continue;
+
+            LOGW(TAG "so_hook: drift detected (%s) %s off=0x%" PRIx64
+                     " (static 0x%" PRIx64 ") addr=0x%" PRIx64
+                     " expected=0x%" PRIx64 " got=0x%" PRIx64 " -> reapply",
+                 reason, state.so_name.c_str(), hook_off, hook_off + kStaticImageBase,
+                 target_addr, expected, current);
+
+            if (ptrace(PTRACE_POKEDATA, pid, (void *)target_addr, (void *)expected) != 0) {
+                LOGE(TAG "so_hook: reapply failed at 0x%" PRIx64 ": %s",
+                     target_addr, strerror(errno));
+                continue;
+            }
+
+            uint64_t verify = 0;
+            if (!ptrace_read_word(pid, target_addr, verify) || verify != expected) {
+                LOGE(TAG "so_hook: reapply verify failed at 0x%" PRIx64
+                         " expected=0x%" PRIx64 " got=0x%" PRIx64,
+                     target_addr, expected, verify);
+                continue;
+            }
+            LOGI(TAG "so_hook: restored (%s) %s off=0x%" PRIx64
+                     " (static 0x%" PRIx64 ") addr=0x%" PRIx64,
+                 reason, state.so_name.c_str(), hook_off, hook_off + kStaticImageBase, target_addr);
+        }
+    }
+}
+
 static void refresh_maps_cache(pid_t pid) {
     uint64_t now = now_ms();
     if (!g_maps_cache.empty() && (now - g_maps_cache_time) < 1000) return;
@@ -693,11 +897,17 @@ static void refresh_maps_cache(pid_t pid) {
     while (fgets(line, sizeof(line), fp)) {
         maps_entry e{};
         char perms[8];
-        unsigned long offset, dev_major, dev_minor, inode;
-        int n = sscanf(line, "%" PRIx64 "-%" PRIx64 " %4s %lx %lx:%lx %lu %255s",
+        unsigned long long offset = 0;
+        unsigned long dev_major = 0;
+        unsigned long dev_minor = 0;
+        unsigned long inode = 0;
+        int n = sscanf(line, "%" PRIx64 "-%" PRIx64 " %4s %llx %lx:%lx %lu %255s",
                        &e.start, &e.end, perms, &offset,
                        &dev_major, &dev_minor, &inode, e.name);
-        if (n >= 2) g_maps_cache.push_back(e);
+        if (n >= 2) {
+            e.file_off = (n >= 4) ? (uint64_t)offset : 0;
+            g_maps_cache.push_back(e);
+        }
     }
     fclose(fp);
 }
@@ -706,10 +916,13 @@ static std::string resolve_caller_cached(pid_t pid, uint64_t pc) {
     refresh_maps_cache(pid);
     for (auto &e : g_maps_cache) {
         if (pc >= e.start && pc < e.end) {
-            const char *basename = strrchr(e.name, '/');
-            basename = basename ? basename + 1 : e.name;
-            char buf[320];
-            snprintf(buf, sizeof(buf), "%s+0x%" PRIx64, basename, pc - e.start);
+            const char *name = e.name[0] ? e.name : "[anon]";
+            const char *basename = strrchr(name, '/');
+            basename = basename ? basename + 1 : name;
+            uint64_t so_off = (pc - e.start) + e.file_off;
+            char buf[384];
+            snprintf(buf, sizeof(buf), "%s+0x%" PRIx64 " (static 0x%" PRIx64 ")",
+                     basename, so_off, so_off + kStaticImageBase);
             return buf;
         }
     }
@@ -907,11 +1120,71 @@ static const char* syscall_name(uint64_t nr) {
 #ifdef __NR_mprotect
         case __NR_mprotect:   return "mprotect";
 #endif
+        case __NR_exit:       return "exit";
         case __NR_exit_group: return "exit_group";
         case __NR_kill:       return "kill";
+#ifdef __NR_tkill
+        case __NR_tkill:      return "tkill";
+#endif
         case __NR_tgkill:     return "tgkill";
+#ifdef __NR_rt_sigqueueinfo
+        case __NR_rt_sigqueueinfo: return "rt_sigqueueinfo";
+#endif
+#ifdef __NR_rt_tgsigqueueinfo
+        case __NR_rt_tgsigqueueinfo: return "rt_tgsigqueueinfo";
+#endif
+#ifdef __NR_pidfd_send_signal
+        case __NR_pidfd_send_signal: return "pidfd_send_signal";
+#endif
         default:              return "unknown";
     }
+}
+
+static bool is_process_kill_syscall(uint64_t nr) {
+    if (nr == __NR_exit_group || nr == __NR_kill || nr == __NR_tgkill) return true;
+#ifdef __NR_exit
+    if (nr == __NR_exit) return true;
+#endif
+#ifdef __NR_tkill
+    if (nr == __NR_tkill) return true;
+#endif
+#ifdef __NR_rt_sigqueueinfo
+    if (nr == __NR_rt_sigqueueinfo) return true;
+#endif
+#ifdef __NR_rt_tgsigqueueinfo
+    if (nr == __NR_rt_tgsigqueueinfo) return true;
+#endif
+#ifdef __NR_pidfd_send_signal
+    if (nr == __NR_pidfd_send_signal) return true;
+#endif
+    return false;
+}
+
+static bool extract_signal_arg(uint64_t nr, const tracer_regs &regs, uint64_t *out_sig) {
+    if (!out_sig) return false;
+    if (nr == __NR_kill
+#ifdef __NR_tkill
+        || nr == __NR_tkill
+#endif
+#ifdef __NR_rt_sigqueueinfo
+        || nr == __NR_rt_sigqueueinfo
+#endif
+#ifdef __NR_pidfd_send_signal
+        || nr == __NR_pidfd_send_signal
+#endif
+    ) {
+        *out_sig = tracer_get_arg(regs, 1);
+        return true;
+    }
+    if (nr == __NR_tgkill
+#ifdef __NR_rt_tgsigqueueinfo
+        || nr == __NR_rt_tgsigqueueinfo
+#endif
+    ) {
+        *out_sig = tracer_get_arg(regs, 2);
+        return true;
+    }
+    return false;
 }
 
 // =========================================================================
@@ -1050,6 +1323,7 @@ void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool ve
     g_so_hook_fds_raw.clear();
     g_all_so_hooks_done = so_hooks.empty();
     g_last_so_hook_probe_ms = 0;
+    g_last_so_hook_verify_ms = 0;
     for (auto &shc : so_hooks) {
         so_hook_state state;
         state.so_name = shc.so_name;
@@ -1099,33 +1373,36 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
 
     uint64_t nr = tracer_get_syscall_nr(regs);
 
-    // Fallback path for ROMs where linker does not close the SO fd.
-    maybe_apply_so_hooks_fallback(pid, "seccomp-stop", false);
+    // Keep checking that patched bytes stay intact; some protections rewrite
+    // prologues back at runtime.
+    maybe_verify_so_hooks_integrity(pid, "seccomp-stop", false);
 
     // ---- Intercept process-killing syscalls: always log + backtrace ----
-    if (nr == __NR_exit_group || nr == __NR_kill || nr == __NR_tgkill) {
+    if (is_process_kill_syscall(nr)) {
         uint64_t pc = tracer_get_pc(regs);
         std::string caller = resolve_caller_cached(pid, pc);
-        const char *action = g_block_self_kill ? "BLOCKED" : "DETECTED";
-
-        if (nr == __NR_exit_group) {
-            uint64_t exit_code = tracer_get_arg(regs, 0);
-            LOGE(TAG "%s exit_group(%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
-                 action, (unsigned long long)exit_code, pid, pc, caller.c_str());
-        } else if (nr == __NR_kill) {
-            uint64_t target_pid_arg = tracer_get_arg(regs, 0);
-            uint64_t sig = tracer_get_arg(regs, 1);
-            LOGE(TAG "%s kill(pid=%llu, sig=%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
-                 action, (unsigned long long)target_pid_arg, (unsigned long long)sig,
-                 pid, pc, caller.c_str());
-        } else {
-            uint64_t tgid_arg = tracer_get_arg(regs, 0);
-            uint64_t tid_arg = tracer_get_arg(regs, 1);
-            uint64_t sig = tracer_get_arg(regs, 2);
-            LOGE(TAG "%s tgkill(tgid=%llu, tid=%llu, sig=%llu) from pid=%d PC=0x%" PRIx64 " caller=%s",
-                 action, (unsigned long long)tgid_arg, (unsigned long long)tid_arg,
-                 (unsigned long long)sig, pid, pc, caller.c_str());
+        uint64_t sig_arg = 0;
+        bool has_sig_arg = extract_signal_arg(nr, regs, &sig_arg);
+        bool should_block = false;
+        if (g_block_self_kill) {
+            if (nr == __NR_exit_group
+#ifdef __NR_exit
+                || nr == __NR_exit
+#endif
+            ) {
+                should_block = true;
+            } else if (has_sig_arg && (int64_t)sig_arg == SIGKILL) {
+                should_block = true;
+            }
         }
+        const char *action = should_block ? "BLOCKED" : "DETECTED";
+
+        LOGE(TAG "%s %s(args=[%llu,%llu,%llu]) from pid=%d PC=0x%" PRIx64 " caller=%s",
+             action, syscall_name(nr),
+             (unsigned long long)tracer_get_arg(regs, 0),
+             (unsigned long long)tracer_get_arg(regs, 1),
+             (unsigned long long)tracer_get_arg(regs, 2),
+             pid, pc, caller.c_str());
 
         if (g_log_fp) {
             fprintf(g_log_fp, "[KILL_INTERCEPT] %s nr=%s pid=%d PC=0x%" PRIx64 " caller=%s args=[%llu,%llu,%llu]\n",
@@ -1139,7 +1416,7 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
         // Capture full stack backtrace for caller analysis
         capture_backtrace(pid, regs);
 
-        if (g_block_self_kill) {
+        if (should_block) {
             // Block the syscall by replacing nr with -1 (returns -ENOSYS)
             tracer_set_syscall_nr(regs, (uint64_t)-1);
             tracer_setregs(pid, regs);
@@ -1453,15 +1730,19 @@ void handle_syscall_exit(pid_t pid) {
              pid, (unsigned long long)fd_val, (long long)ret,
              g_so_hook_fds.size() + g_so_hook_fds_raw.size());
 
-        // SO load-time hook: apply patches when target SO's fd is closed
-        // At this point the SO is mmap'd but .init_array hasn't run yet
+        // SO load-time hook: do NOT patch here.
+        // At close(fd) time the linker has mmap'd the pages but may not have
+        // filled the content yet (pread/demand-page happens later).  Patching
+        // now would write to zero-filled pages (old=0x0).
+        // Instead we only clean up fd tracking; the actual patch is deferred
+        // to the mprotect-exit handler which fires after the linker does its
+        // final mprotect(addr, len, PROT_READ|PROT_EXEC) — at that point the
+        // .text content is guaranteed to be loaded.
         if (have_so_idx) {
-            LOGI(TAG "so_hook: close(fd=%llu) matched hook_idx=%zu, ret=%lld, done=%d",
+            LOGI(TAG "so_hook: close(fd=%llu) matched hook_idx=%zu, ret=%lld, done=%d"
+                     " -> deferring patch to mprotect-exit",
                  (unsigned long long)fd_val, so_idx, (long long)ret,
                  (so_idx < g_so_hooks.size()) ? g_so_hooks[so_idx].done : -1);
-            if (ret == 0 && so_idx < g_so_hooks.size() && !g_so_hooks[so_idx].done) {
-                apply_so_hooks_via_ptrace(pid, so_idx);
-            }
             if (ret == 0) erase_so_hook_fd_tracking(pid, fd_val);
         } else {
             LOGI(TAG "close-exit: fd=%llu NOT in tracked so fds (tgid=%d)",
@@ -1522,7 +1803,7 @@ void handle_syscall_exit(pid_t pid) {
                             break;
                         }
                     }
-                    maybe_apply_so_hooks_fallback(pid, "openat-exit", true);
+                    // Do not patch here — SO is only opened, not loaded yet.
                 }
 
                 if (is_proc_maps_path(path_str)) {
@@ -1603,12 +1884,14 @@ void handle_syscall_exit(pid_t pid) {
                      (unsigned long long)fd_val, map_addr, map_off, prot,
                      fd_path.empty() ? "?" : fd_path.c_str(), load_bias);
 
-                if ((prot & PROT_EXEC) != 0) {
-                    bool patched = (idx < g_so_hooks.size()) &&
-                                   apply_so_hooks_at_load_bias(pid, idx, load_bias, "mmap-exec");
-                    if (patched) {
-                        erase_so_hook_fd_tracking(pid, fd_val);
-                    }
+                // Do NOT patch here.  The linker issues multiple mmap(MAP_FIXED)
+                // calls for each segment; patching now would be overwritten by a
+                // subsequent mmap that re-maps the same address range.
+                // Just record the load_bias so mprotect-exit can use it later.
+                if (idx < g_so_hooks.size() && g_so_hooks[idx].load_bias == 0) {
+                    g_so_hooks[idx].load_bias = load_bias;
+                    LOGI(TAG "so_hook: recorded load_bias=0x%" PRIxPTR " for %s (deferred to mprotect-exit)",
+                         load_bias, g_so_hooks[idx].so_name.c_str());
                 }
             } else if (g_verbose_logs && fd_val != (uint64_t)-1 &&
                        resolve_tracee_tgid(pid) == g_target_pid) {
@@ -1617,9 +1900,9 @@ void handle_syscall_exit(pid_t pid) {
                      (unsigned long long)fd_val, unmatched_path.c_str());
             }
         }
-        if (!g_all_so_hooks_done) {
-            maybe_apply_so_hooks_fallback(pid, "mmap-exit", true);
-        }
+        // Do NOT call maybe_apply_so_hooks_fallback here.
+        // mmap-exit is too early: linker will issue more mmap(MAP_FIXED) calls
+        // that overwrite pages we might have patched.  Defer to mprotect-exit.
     }
 #endif
 #ifdef __NR_mprotect
@@ -1630,8 +1913,11 @@ void handle_syscall_exit(pid_t pid) {
             uint64_t prot = have_pending ? pending.args[2] : tracer_get_arg(regs, 2);
             if ((prot & PROT_EXEC) != 0) {
                 LOGI(TAG "so_hook: mprotect-exit addr=0x%" PRIx64
-                         " len=0x%" PRIx64 " prot=0x%" PRIx64 " -> try patch",
+                         " len=0x%" PRIx64 " prot=0x%" PRIx64 " -> apply patches NOW",
                      addr, len, prot);
+                // This is the ideal patch point: the linker has finished
+                // filling the .text segment and is now making it r-xp.
+                // Force immediate patch attempt (bypass throttle).
                 maybe_apply_so_hooks_fallback(pid, "mprotect-exit", true);
             }
         }
@@ -1742,4 +2028,5 @@ void syscall_handler_fini() {
     g_so_hook_fds.clear();
     g_so_hook_fds_raw.clear();
     g_last_so_hook_probe_ms = 0;
+    g_last_so_hook_verify_ms = 0;
 }

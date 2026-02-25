@@ -103,21 +103,37 @@ static bool run_remote_syscall(pid_t pid,
         return false;
     }
 
+    // The svc #0 may trigger a PTRACE_EVENT_SECCOMP stop before the kernel
+    // executes the syscall (because the target has our seccomp filter installed).
+    // Transparently pass it through until we get the brk #0 SIGTRAP.
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        LOGE(TAG "waitpid failed after syscall %llu: %s",
-             (unsigned long long)nr, strerror(errno));
-        return false;
-    }
+    for (;;) {
+        if (waitpid(pid, &status, 0) < 0) {
+            LOGE(TAG "waitpid failed after syscall %llu: %s",
+                 (unsigned long long)nr, strerror(errno));
+            return false;
+        }
 
-    if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-        if (WIFSTOPPED(status)) {
-            LOGE(TAG "unexpected stop signal %d after syscall %llu (status=0x%x)",
-                 WSTOPSIG(status), (unsigned long long)nr, status);
-        } else {
+        if (!WIFSTOPPED(status)) {
             LOGE(TAG "target not stopped after syscall %llu (status=0x%x)",
                  (unsigned long long)nr, status);
+            return false;
         }
+
+        int event = (status >> 16) & 0xFF;
+        if (event == PTRACE_EVENT_SECCOMP) {
+            // Our own remote syscall hit the seccomp filter — just let it run.
+            ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+            continue;
+        }
+
+        // Expected: brk #0 delivers SIGTRAP (event==0).
+        if (WSTOPSIG(status) == SIGTRAP && event == 0) {
+            break;
+        }
+
+        LOGE(TAG "unexpected stop signal %d event %d after syscall %llu (status=0x%x)",
+             WSTOPSIG(status), event, (unsigned long long)nr, status);
         return false;
     }
 
@@ -387,4 +403,59 @@ int inject_seccomp_filter(pid_t pid, const seccomp_bpf_program &prog,
     }
 
     return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Public: execute one syscall in the stopped target via ptrace trampoline.
+// Writes svc+brk at the current PC (code page), executes it, then restores.
+// PTRACE_POKEDATA on code pages works for the trampoline because the kernel
+// calls flush_ptrace_access() which invalidates the I-cache for the written
+// range, and we execute the trampoline immediately after writing it.
+// ---------------------------------------------------------------------------
+bool ptrace_remote_syscall(pid_t pid,
+                           uint64_t nr,
+                           uint64_t a0, uint64_t a1, uint64_t a2,
+                           uint64_t a3, uint64_t a4, uint64_t a5,
+                           int64_t &ret_out) {
+    tracer_regs orig_regs;
+    if (!tracer_getregs(pid, orig_regs)) {
+        LOGE(TAG "ptrace_remote_syscall: GETREGSET failed: %s", strerror(errno));
+        return false;
+    }
+
+    uint64_t tramp_pc = tracer_get_pc(orig_regs);
+
+    // Backup 8 bytes at current PC
+    uint8_t code_backup[8] = {};
+    if (!ptrace_read(pid, tramp_pc, code_backup, sizeof(code_backup))) {
+        LOGE(TAG "ptrace_remote_syscall: failed to backup code at PC=0x%llx: %s",
+             (unsigned long long)tramp_pc, strerror(errno));
+        return false;
+    }
+
+    // Write trampoline at current PC: svc #0 / brk #0
+    // This works on code pages because PTRACE_POKEDATA triggers
+    // flush_ptrace_access() in the kernel, and we execute immediately.
+    const uint32_t tramp_code[2] = { 0xD4000001, 0xD4200000 };
+    if (!ptrace_write(pid, tramp_pc, tramp_code, sizeof(tramp_code))) {
+        LOGE(TAG "ptrace_remote_syscall: failed to write trampoline: %s",
+             strerror(errno));
+        return false;
+    }
+
+    tracer_regs exec_regs = orig_regs;
+    bool ok = run_remote_syscall(pid, exec_regs, tramp_pc,
+                                 nr, a0, a1, a2, a3, a4, a5,
+                                 ret_out);
+
+    // Restore code and registers
+    if (!ptrace_write(pid, tramp_pc, code_backup, sizeof(code_backup))) {
+        LOGW(TAG "ptrace_remote_syscall: failed to restore code (non-fatal)");
+    }
+    if (!tracer_setregs(pid, orig_regs)) {
+        LOGE(TAG "ptrace_remote_syscall: failed to restore registers: %s", strerror(errno));
+        return false;
+    }
+
+    return ok;
 }
