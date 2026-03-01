@@ -14,7 +14,7 @@
     "tracer_verbose_logs": true,
     "dobby_hooks": [
       {
-        "so_name": "libtprt.so",
+        "so_name": "xxx.so",
         "hooks": [
           {"offset": "0x163c10", "return_value": -1}
         ]

@@ -18,24 +18,20 @@
                     }
                 ]
             },
-            "gadget_interaction": "listen",
+            "gadget_interaction": "connect",
             "gadget_listen_port": 0,
             "gadget_connect_address": "127.0.0.1",
             "gadget_connect_port": 27052,
-            "gadget_connect_use_unix_proxy": false,
+            "gadget_connect_use_unix_proxy": true,
             "gadget_connect_unix_name": "",
             "tracer_mode": "probe",
             "tracer_log_path": "/data/local/tmp/re.zyg.fri/syscall_trace.log",
             "tracer_verbose_logs": false,
             "so_load_patches": [
                 {
-                    "so_name": "libtprt.so",
+                    "so_name": "xxx.so",
                     "hooks": [
-                        {"offset": "0x4bc488", "return_value": 0},
-                        {"offset": "0x4d8bd8", "return_value": 0},
-                        {"offset": "0x4e57d0", "return_value": 0},
-                        {"offset": "0x4bd370", "return_value": 0},
-                        {"offset": "0x4b1f68", "return_value": 0}
+                        {"offset": "0x4bc488", "return_value": 0}
                     ]
                 }
             ]
