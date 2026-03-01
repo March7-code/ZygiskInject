@@ -4,7 +4,9 @@
 
 ### 已知问题：
 
-ptracer是双刃剑、既能很好地通过seccomap分析系统调用，但是又及其容易被检测，一时半会也想不到什么更好的办法去改。还在想办法捕捉更多检测行为、以及检测到了frida的哪些部分，来做反制，不知道之后能不能实现。
+ptracer是双刃剑、既能很好地通过seccomap分析系统调用，但是又及其容易被检测，一时半会也想不到什么更好的办法去改。还在想办法捕捉更多检测行为、以及检测到了frida的哪些部分，来做反制，不知道之后能不能实现，或者说干脆只在启动的时候patch，之后就退掉ptrace，应该也是能过掉相关的检测的。
+
+另外一个问题就是Frida本身，有可能需要根据 被检测-> 应用退出-> 收集检测点，这个逻辑来自己手动hook掉检测。
 
 ## 设计想法
 
@@ -143,6 +145,20 @@ adb shell 'su -c "cat /data/local/tmp/re.zyg.fri/syscall_trace.log"'
 
 - 已 Root 的设备（Magisk + Zygisk 启用）
 - NDK 25.2.9519653（构建时需要）
+
+## 运行日志：
+
+<img src="picture/edcbc5598a633366a9bd4c22ce891947.jpg" alt="e8904cbb399a452e52fd9a0077e31816" style="zoom:50%;" />
+
+### 注入：
+
+<img src="picture/04880675-c70f-432e-801b-b631c003724f.png" alt="e8904cbb399a452e52fd9a0077e31816" style="zoom:50%;" />
+
+### 远端通过frida-portal和frida-tools来通讯：
+
+<img src="picture/8077054f-852d-435e-bb38-479e972a8275.png" alt="e8904cbb399a452e52fd9a0077e31816" style="zoom:50%;" />
+
+
 
 ## TODO
 
