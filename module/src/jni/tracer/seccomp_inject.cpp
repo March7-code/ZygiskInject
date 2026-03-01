@@ -24,6 +24,13 @@
 #define __NR_seccomp 277
 #endif
 
+static constexpr long kSiblingPtraceOptions =
+        PTRACE_O_TRACESECCOMP |
+        PTRACE_O_TRACECLONE |
+        PTRACE_O_TRACEFORK |
+        PTRACE_O_TRACEVFORK |
+        PTRACE_O_TRACESYSGOOD;
+
 // ---------------------------------------------------------------------------
 // ptrace memory helpers
 // ---------------------------------------------------------------------------
@@ -325,7 +332,7 @@ static void inject_into_existing_threads(pid_t tgid, const seccomp_bpf_program &
 
         // PTRACE_SEIZE the sibling thread
         if (ptrace(PTRACE_SEIZE, tid, nullptr,
-                   (void*)(uintptr_t)(PTRACE_O_TRACESECCOMP | PTRACE_O_TRACESYSGOOD)) < 0) {
+                   (void *)(uintptr_t)kSiblingPtraceOptions) < 0) {
             LOGW(TAG "PTRACE_SEIZE tid %d failed: %s (may already be traced)", tid, strerror(errno));
             // Thread might already be auto-traced via PTRACE_O_TRACECLONE.
             // Try PTRACE_INTERRUPT directly.
@@ -349,6 +356,11 @@ static void inject_into_existing_threads(pid_t tgid, const seccomp_bpf_program &
 
         if (inject_seccomp_filter_thread(tid, prog) < 0) {
             LOGW(TAG "filter injection failed for existing tid %d", tid);
+        }
+
+        if (ptrace(PTRACE_SETOPTIONS, tid, nullptr,
+                   (void *)(uintptr_t)kSiblingPtraceOptions) < 0) {
+            LOGW(TAG "PTRACE_SETOPTIONS tid %d failed: %s", tid, strerror(errno));
         }
 
         ptrace(PTRACE_CONT, tid, nullptr, nullptr);

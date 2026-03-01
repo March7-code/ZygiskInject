@@ -1,9 +1,9 @@
 #include "seccomp_filter.h"
+#include "syscall_rules.h"
 
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
-#include <sys/syscall.h>
 #include <cstddef>
 
 // seccomp_data layout:
@@ -69,64 +69,5 @@ seccomp_bpf_program build_seccomp_filter(const std::vector<uint32_t> &syscall_nr
 }
 
 seccomp_bpf_program build_default_io_filter(bool block_self_kill) {
-    std::vector<uint32_t> nrs;
-
-    // ARM64 does NOT have __NR_open or __NR_access (removed in aarch64 ABI).
-    // Only the *at variants exist.
-    nrs.push_back(__NR_openat);
-    nrs.push_back(__NR_faccessat);
-#ifdef __NR_newfstatat
-    nrs.push_back(__NR_newfstatat);   // fstatat64 on arm64, also covers lstat
-#endif
-    nrs.push_back(__NR_readlinkat);
-    nrs.push_back(__NR_statx);        // newer kernels prefer statx
-
-    // Needed for anti-cheat that uses opendir() to enumerate /proc/self/task
-    // or /proc/self/fd — opendir internally calls getdents64.
-    nrs.push_back(__NR_getdents64);
-
-    // Needed for TracerPid hiding: intercept read() so we can tamper with
-    // the buffer content after the kernel writes /proc/self/status data.
-    // Also used for ELF checksum bypass: tamper read() on library fds.
-    nrs.push_back(__NR_read);
-#ifdef __NR_pread64
-    // Some libc paths read procfs via pread64().
-    nrs.push_back(__NR_pread64);
-#endif
-    // Track fd lifecycle so reused fd numbers do not keep stale tamper state.
-    nrs.push_back(__NR_close);
-#ifdef __NR_mmap
-    // SO load-time hook fallback: linker maps target ELF via mmap.
-    nrs.push_back(__NR_mmap);
-#endif
-#ifdef __NR_mprotect
-    // SO load-time hook fallback: constructors typically run after final RX mprotect.
-    nrs.push_back(__NR_mprotect);
-#endif
-
-    // Process-killing syscalls: only intercept when blocking is enabled.
-    // SECCOMP_RET_TRACE on untraced threads causes the kernel to return -ENOSYS,
-    // which silently blocks the syscall and can cause the app to hang.
-    if (block_self_kill) {
-#ifdef __NR_exit
-        nrs.push_back(__NR_exit);
-#endif
-        nrs.push_back(__NR_exit_group);
-        nrs.push_back(__NR_kill);
-#ifdef __NR_tkill
-        nrs.push_back(__NR_tkill);
-#endif
-        nrs.push_back(__NR_tgkill);
-#ifdef __NR_rt_sigqueueinfo
-        nrs.push_back(__NR_rt_sigqueueinfo);
-#endif
-#ifdef __NR_rt_tgsigqueueinfo
-        nrs.push_back(__NR_rt_tgsigqueueinfo);
-#endif
-#ifdef __NR_pidfd_send_signal
-        nrs.push_back(__NR_pidfd_send_signal);
-#endif
-    }
-
-    return build_seccomp_filter(nrs);
+    return build_seccomp_filter(build_default_tracer_syscall_nrs(block_self_kill));
 }

@@ -27,7 +27,7 @@
             "tracer_mode": "probe",
             "tracer_log_path": "/data/local/tmp/re.zyg.fri/syscall_trace.log",
             "tracer_verbose_logs": false,
-            "dobby_hooks": [
+            "so_load_patches": [
                 {
                     "so_name": "libtprt.so",
                     "hooks": [

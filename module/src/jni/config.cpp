@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <optional>
+#include <cctype>
 
 #include "rapidjson/document.h"
 #include "rapidjson/istreamwrapper.h"
@@ -14,6 +15,36 @@
 // This must work in a non-exception environment as the libcxx we use don't have support for exception.
 // Should avoid any libraries aborting on parse error as this will run on every app start and
 // might otherwise cause issues for any app starting if misconfigured.
+
+static std::string trim_copy(const std::string &value) {
+    size_t begin = 0;
+    size_t end = value.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) begin++;
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) end--;
+    return value.substr(begin, end - begin);
+}
+
+static std::string to_lower_ascii(std::string value) {
+    for (char &ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
+static std::string normalize_tracer_mode(const std::string &raw_mode) {
+    std::string mode = to_lower_ascii(trim_copy(raw_mode));
+    if (mode.empty() || mode == "off") {
+        return "off";
+    }
+    if (mode == "probe" || mode == "block") {
+        // Current wire protocol recognizes "probe"; keep "block" as compatibility alias.
+        return "probe";
+    }
+    LOGW("unknown tracer_mode '%s', fallback to 'off'", raw_mode.c_str());
+    return "off";
+}
+
+static bool g_logged_off_mode_patch_disable = false;
 
 static std::optional<std::vector<std::string>> deserialize_libraries(const rapidjson::Value &doc) {
     if (!doc.IsArray()) {
@@ -210,9 +241,9 @@ static std::optional<target_config> deserialize_target_config(const rapidjson::V
         }
     }
 
-    // Dobby inline hook settings
-    if (doc.HasMember("dobby_hooks")) {
-        auto &arr = doc["dobby_hooks"];
+    // SO load-time patch settings
+    if (doc.HasMember("so_load_patches")) {
+        auto &arr = doc["so_load_patches"];
         if (arr.IsArray()) {
             for (rapidjson::SizeType i = 0; i < arr.Size(); i++) {
                 auto &entry = arr[i];
@@ -243,10 +274,26 @@ static std::optional<target_config> deserialize_target_config(const rapidjson::V
                 }
 
                 if (!shc.hooks.empty()) {
-                    result.dobby_hooks.push_back(shc);
+                    result.so_load_patches.push_back(shc);
                 }
             }
         }
+    }
+
+    std::string normalized_mode = normalize_tracer_mode(result.tracer_mode);
+    if (normalized_mode != result.tracer_mode) {
+        LOGI("normalized tracer_mode: '%s' -> '%s'",
+             result.tracer_mode.c_str(), normalized_mode.c_str());
+        result.tracer_mode = normalized_mode;
+    }
+
+    if (result.tracer_mode == "off" && !result.so_load_patches.empty()) {
+        if (!g_logged_off_mode_patch_disable) {
+            LOGW("tracer_mode is off, disabling so_load_patches (%zu entries)",
+                 result.so_load_patches.size());
+            g_logged_off_mode_patch_disable = true;
+        }
+        result.so_load_patches.clear();
     }
 
     return result;

@@ -3,8 +3,11 @@
 #include <link.h>
 #include <sys/mman.h>
 
+#include <cerrno>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -16,12 +19,12 @@ struct PROCMAPSINFO {
     uintptr_t start, end, offset;
     uint8_t perms;
     ino_t inode;
-    char* dev;
-    char* path;
+    std::string dev;
+    std::string path;
 };
 
 
-std::vector<PROCMAPSINFO> get_modules_by_name(std::string mName) {
+std::vector<PROCMAPSINFO> get_modules_by_name(const std::string &m_name) {
     std::string process_maps_locations = "/proc/self/maps";
 
     std::vector<PROCMAPSINFO> maps;
@@ -34,22 +37,26 @@ std::vector<PROCMAPSINFO> get_modules_by_name(std::string mName) {
     }
 
     while (fgets(buffer, sizeof(buffer), fp)) {
-        if (strstr(buffer, mName.c_str())) {
+        if (strstr(buffer, m_name.c_str())) {
             PROCMAPSINFO info{};
-            char perms[10];
-            char path[255];
-            char dev[25];
+            char perms[10] = {0};
+            char path[255] = {0};
+            char dev[25] = {0};
+            unsigned long long inode = 0;
 
-            sscanf(
+            int parsed = sscanf(
                 buffer,
-                "%" SCNxPTR "-%" SCNxPTR " %s %" SCNxPTR " %s %ld %s",
-                &info.start, &info.end, perms, &info.offset, dev, &info.inode, path);
+                "%" SCNxPTR "-%" SCNxPTR " %9s %" SCNxPTR " %24s %llu %254s",
+                &info.start, &info.end, perms, &info.offset, dev, &inode, path);
+            if (parsed < 7) {
+                continue;
+            }
+            info.inode = (ino_t)inode;
 
             /* Store process permissions in the struct directly via bitwise operations */
             if (strchr(perms, 'r')) info.perms |= PROT_READ;
             if (strchr(perms, 'w')) info.perms |= PROT_WRITE;
             if (strchr(perms, 'x')) info.perms |= PROT_EXEC;
-            if (strchr(perms, 'r')) info.perms |= PROT_READ;
 
             info.dev = dev;
             info.path = path;
@@ -73,30 +80,48 @@ void remap_lib(std::string lib_path) {
 
     LOGI("Remapping %s", lib_name.c_str());
 
-    for (PROCMAPSINFO info : maps) {
+    for (const PROCMAPSINFO &info : maps) {
         void *address = reinterpret_cast<void *>(info.start);
         size_t size = info.end - info.start;
-
-        void *map = mmap(0, size, PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-
-        if ((info.perms & PROT_READ) == 0) {
-            LOGI("Removing memory protection: %s", info.path);
-            mprotect(address, size, PROT_READ);
+        if (size == 0) {
+            continue;
         }
 
-        if (map == nullptr) {
-            LOGE("Failed to Allocate Memory: %s", strerror(errno));
-            return;
+        void *map = mmap(nullptr, size, PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        if (map == MAP_FAILED) {
+            LOGE("Failed to allocate memory: %s", strerror(errno));
+            continue;
+        }
+
+        if ((info.perms & PROT_READ) == 0) {
+            LOGI("Removing memory protection: %s", info.path.c_str());
+            if (mprotect(address, size, PROT_READ) != 0) {
+                LOGE("Failed to update memory protection for %s: %s",
+                     info.path.c_str(), strerror(errno));
+                munmap(map, size);
+                continue;
+            }
         }
 
         /* Copy the in-memory data to new virtual location via the memove, allocate and commit it via mremap */
         std::memmove(map, address, size);
-        mremap(map, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, info.start);
+        void *remap_result = mremap(map, size, size,
+                                    MREMAP_MAYMOVE | MREMAP_FIXED,
+                                    reinterpret_cast<void *>(info.start));
+        if (remap_result == MAP_FAILED) {
+            LOGE("Failed to remap segment %s: %s", info.path.c_str(), strerror(errno));
+            munmap(map, size);
+            continue;
+        }
 
         /* Re-apply memory protections */
-        mprotect(reinterpret_cast<void *>(info.start), size, info.perms);
+        if (mprotect(reinterpret_cast<void *>(info.start), size, info.perms) != 0) {
+            LOGE("Failed to restore memory protection for %s: %s",
+                 info.path.c_str(), strerror(errno));
+            continue;
+        }
 
-        LOGI("Allocated at address %p with size of %zu", map, size);
+        LOGI("Remapped segment %s at %p with size %zu", info.path.c_str(), map, size);
     }
 
     LOGI("Remapped");

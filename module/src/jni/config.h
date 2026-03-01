@@ -65,9 +65,10 @@ struct target_config{
     // When false (default), allow them to execute but still log + capture backtrace.
     bool tracer_block_self_kill = false;
 
-    // Dobby inline hook settings.
-    // Each entry specifies a SO name and a list of offsets to hook.
-    std::vector<so_hook_config> dobby_hooks;
+    // SO load-time patch settings (applied by tracer via ptrace).
+    // Only effective when tracer_mode != "off".
+    // Each entry specifies a SO name and a list of offsets to patch.
+    std::vector<so_hook_config> so_load_patches;
 };
 
 std::optional<target_config> load_config(std::string const& module_dir, std::string const& app_name);

@@ -1,6 +1,8 @@
 #include "syscall_handler.h"
 #include "arch.h"
 #include "seccomp_inject.h"
+#include "syscall_rules.h"
+#include "tracer_stealth.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -444,77 +446,9 @@ static void erase_so_hook_fd_tracking(pid_t tid, uint64_t fd) {
     g_so_hook_fds_raw.erase(fd);
 }
 
-static bool is_proc_task_status_path(const std::string &path,
-                                     const std::string &prefix) {
-    // Match "<prefix><tid>/status", where <tid> is decimal.
-    if (path.rfind(prefix, 0) != 0) return false;
-
-    size_t tid_start = prefix.size();
-    size_t slash_pos = path.find('/', tid_start);
-    if (slash_pos == std::string::npos) return false;
-    if (slash_pos + 7 != path.size()) return false;
-    if (path.compare(slash_pos, 7, "/status") != 0) return false;
-
-    if (slash_pos == tid_start) return false;
-    for (size_t i = tid_start; i < slash_pos; ++i) {
-        char c = path[i];
-        if (c < '0' || c > '9') return false;
-    }
-    return true;
-}
-
-static bool parse_proc_numeric_leaf(const std::string &path,
-                                    const char *leaf,
-                                    pid_t *out_pid) {
-    const std::string prefix = "/proc/";
-    if (path.rfind(prefix, 0) != 0) return false;
-
-    size_t num_start = prefix.size();
-    size_t slash_pos = path.find('/', num_start);
-    if (slash_pos == std::string::npos) return false;
-    if (slash_pos + 1 >= path.size()) return false;
-
-    const std::string suffix = std::string("/") + leaf;
-    if (path.compare(slash_pos, suffix.size(), suffix) != 0) return false;
-    if (slash_pos + suffix.size() != path.size()) return false;
-
-    if (slash_pos == num_start) return false;
-    int value = 0;
-    for (size_t i = num_start; i < slash_pos; ++i) {
-        char c = path[i];
-        if (c < '0' || c > '9') return false;
-        value = value * 10 + (c - '0');
-    }
-    if (value <= 0) return false;
-    if (out_pid) *out_pid = (pid_t)value;
-    return true;
-}
-
-// Check if a path is one of:
-// - /proc/self/status
-// - /proc/<target_pid>/status
-// - /proc/self/task/<tid>/status
-// - /proc/<target_pid>/task/<tid>/status
-static bool is_proc_status_path(const std::string &path) {
-    if (path == "/proc/self/status") return true;
-    if (path == "/proc/thread-self/status") return true;
-
-    char buf[64];
-    snprintf(buf, sizeof(buf), "/proc/%d/status", g_target_pid);
-    if (path == buf) return true;
-
-    pid_t proc_pid = 0;
-    if (parse_proc_numeric_leaf(path, "status", &proc_pid)) {
-        if (proc_pid == g_target_pid) return true;
-        if (resolve_tracee_tgid(proc_pid) == g_target_pid) return true;
-    }
-
-    if (is_proc_task_status_path(path, "/proc/self/task/")) return true;
-
-    snprintf(buf, sizeof(buf), "/proc/%d/task/", g_target_pid);
-    if (is_proc_task_status_path(path, buf)) return true;
-
-    return false;
+static pid_t resolve_tgid_for_stealth(pid_t tid, void *opaque) {
+    (void)opaque;
+    return resolve_tracee_tgid(tid);
 }
 
 // Set of pids currently waiting for syscall-exit (read on status fd)
@@ -560,61 +494,6 @@ struct maps_fd_state {
     std::string sanitized_maps;
 };
 static std::map<tracked_fd_key, maps_fd_state> g_maps_fd_states;
-
-// Check if a path is /proc/self/maps or /proc/<pid>/maps
-static bool is_proc_maps_path(const std::string &path) {
-    if (path == "/proc/self/maps") return true;
-    if (path == "/proc/thread-self/maps") return true;
-    char buf[64];
-    snprintf(buf, sizeof(buf), "/proc/%d/maps", g_target_pid);
-    if (path == buf) return true;
-
-    pid_t proc_pid = 0;
-    if (parse_proc_numeric_leaf(path, "maps", &proc_pid)) {
-        if (proc_pid == g_target_pid) return true;
-        if (resolve_tracee_tgid(proc_pid) == g_target_pid) return true;
-    }
-    return false;
-}
-
-static void sanitize_maps_line(std::string &line) {
-    bool is_protected = false;
-    for (const auto &lib : g_protected_libs) {
-        if (line.find(lib) != std::string::npos) {
-            is_protected = true;
-            break;
-        }
-    }
-    if (!is_protected) return;
-
-    // maps line: "<start>-<end> <perms> ..."
-    size_t perms_pos = line.find(' ');
-    if (perms_pos == std::string::npos) return;
-    while (perms_pos < line.size() && line[perms_pos] == ' ')
-        perms_pos++;
-
-    if (perms_pos + 2 < line.size() && line[perms_pos + 2] == 'x') {
-        line[perms_pos + 2] = '-';
-    }
-}
-
-static bool build_sanitized_maps_snapshot(pid_t pid, std::string &out) {
-    out.clear();
-
-    char maps_path[64];
-    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
-    FILE *fp = fopen(maps_path, "r");
-    if (!fp) return false;
-
-    char line[1024];
-    while (fgets(line, sizeof(line), fp)) {
-        std::string s(line);
-        sanitize_maps_line(s);
-        out += s;
-    }
-    fclose(fp);
-    return !out.empty();
-}
 
 // Tamper a read() buffer from /proc/self/maps: for lines containing a
 // protected library name with executable permission, change 'x' to '-'
@@ -714,7 +593,8 @@ static bool tamper_maps_read_stream(pid_t pid,
     }
 
     if (state.sanitized_maps.empty()) {
-        if (!build_sanitized_maps_snapshot(g_target_pid, state.sanitized_maps)) {
+        if (!tracer_stealth::build_sanitized_maps_snapshot(
+                g_target_pid, g_protected_libs, state.sanitized_maps)) {
             // Fallback to chunk mode if snapshot cannot be built.
             state.stream_pos += bytes_read;
             return tamper_maps_read_chunk(pid, buf_addr, bytes_read);
@@ -1095,99 +975,6 @@ static bool tamper_tracer_pid(pid_t pid, uint64_t buf_addr, size_t buf_len) {
 }
 
 // =========================================================================
-// Syscall name lookup
-// =========================================================================
-static const char* syscall_name(uint64_t nr) {
-    switch (nr) {
-        case __NR_openat:     return "openat";
-        case __NR_faccessat:  return "faccessat";
-#ifdef __NR_newfstatat
-        case __NR_newfstatat: return "newfstatat";
-#endif
-        case __NR_readlinkat: return "readlinkat";
-#ifdef __NR_statx
-        case __NR_statx:      return "statx";
-#endif
-        case __NR_getdents64: return "getdents64";
-        case __NR_read:       return "read";
-#ifdef __NR_pread64
-        case __NR_pread64:    return "pread64";
-#endif
-        case __NR_close:      return "close";
-#ifdef __NR_mmap
-        case __NR_mmap:       return "mmap";
-#endif
-#ifdef __NR_mprotect
-        case __NR_mprotect:   return "mprotect";
-#endif
-        case __NR_exit:       return "exit";
-        case __NR_exit_group: return "exit_group";
-        case __NR_kill:       return "kill";
-#ifdef __NR_tkill
-        case __NR_tkill:      return "tkill";
-#endif
-        case __NR_tgkill:     return "tgkill";
-#ifdef __NR_rt_sigqueueinfo
-        case __NR_rt_sigqueueinfo: return "rt_sigqueueinfo";
-#endif
-#ifdef __NR_rt_tgsigqueueinfo
-        case __NR_rt_tgsigqueueinfo: return "rt_tgsigqueueinfo";
-#endif
-#ifdef __NR_pidfd_send_signal
-        case __NR_pidfd_send_signal: return "pidfd_send_signal";
-#endif
-        default:              return "unknown";
-    }
-}
-
-static bool is_process_kill_syscall(uint64_t nr) {
-    if (nr == __NR_exit_group || nr == __NR_kill || nr == __NR_tgkill) return true;
-#ifdef __NR_exit
-    if (nr == __NR_exit) return true;
-#endif
-#ifdef __NR_tkill
-    if (nr == __NR_tkill) return true;
-#endif
-#ifdef __NR_rt_sigqueueinfo
-    if (nr == __NR_rt_sigqueueinfo) return true;
-#endif
-#ifdef __NR_rt_tgsigqueueinfo
-    if (nr == __NR_rt_tgsigqueueinfo) return true;
-#endif
-#ifdef __NR_pidfd_send_signal
-    if (nr == __NR_pidfd_send_signal) return true;
-#endif
-    return false;
-}
-
-static bool extract_signal_arg(uint64_t nr, const tracer_regs &regs, uint64_t *out_sig) {
-    if (!out_sig) return false;
-    if (nr == __NR_kill
-#ifdef __NR_tkill
-        || nr == __NR_tkill
-#endif
-#ifdef __NR_rt_sigqueueinfo
-        || nr == __NR_rt_sigqueueinfo
-#endif
-#ifdef __NR_pidfd_send_signal
-        || nr == __NR_pidfd_send_signal
-#endif
-    ) {
-        *out_sig = tracer_get_arg(regs, 1);
-        return true;
-    }
-    if (nr == __NR_tgkill
-#ifdef __NR_rt_tgsigqueueinfo
-        || nr == __NR_rt_tgsigqueueinfo
-#endif
-    ) {
-        *out_sig = tracer_get_arg(regs, 2);
-        return true;
-    }
-    return false;
-}
-
-// =========================================================================
 // Statistics
 // =========================================================================
 static uint64_t g_stat_total = 0;
@@ -1378,11 +1165,12 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
     maybe_verify_so_hooks_integrity(pid, "seccomp-stop", false);
 
     // ---- Intercept process-killing syscalls: always log + backtrace ----
-    if (is_process_kill_syscall(nr)) {
+    if (tracer_is_process_kill_syscall(nr)) {
         uint64_t pc = tracer_get_pc(regs);
         std::string caller = resolve_caller_cached(pid, pc);
         uint64_t sig_arg = 0;
-        bool has_sig_arg = extract_signal_arg(nr, regs, &sig_arg);
+        bool has_sig_arg = tracer_extract_kill_signal_arg(
+            nr, tracer_get_arg(regs, 1), tracer_get_arg(regs, 2), &sig_arg);
         bool should_block = false;
         if (g_block_self_kill) {
             if (nr == __NR_exit_group
@@ -1398,7 +1186,7 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
         const char *action = should_block ? "BLOCKED" : "DETECTED";
 
         LOGE(TAG "%s %s(args=[%llu,%llu,%llu]) from pid=%d PC=0x%" PRIx64 " caller=%s",
-             action, syscall_name(nr),
+             action, tracer_syscall_name(nr),
              (unsigned long long)tracer_get_arg(regs, 0),
              (unsigned long long)tracer_get_arg(regs, 1),
              (unsigned long long)tracer_get_arg(regs, 2),
@@ -1406,7 +1194,7 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
 
         if (g_log_fp) {
             fprintf(g_log_fp, "[KILL_INTERCEPT] %s nr=%s pid=%d PC=0x%" PRIx64 " caller=%s args=[%llu,%llu,%llu]\n",
-                    action, syscall_name(nr), pid, pc, caller.c_str(),
+                    action, tracer_syscall_name(nr), pid, pc, caller.c_str(),
                     (unsigned long long)tracer_get_arg(regs, 0),
                     (unsigned long long)tracer_get_arg(regs, 1),
                     (unsigned long long)tracer_get_arg(regs, 2));
@@ -1511,7 +1299,10 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
             std::string path = read_tracee_string(pid, path_addr);
 
             // Check /proc/self/maps for checksum bypass
-            if (is_proc_maps_path(path) && !g_protected_libs.empty()) {
+            if (tracer_stealth::is_proc_maps_path(path, g_target_pid,
+                                                  resolve_tgid_for_stealth,
+                                                  nullptr) &&
+                !g_protected_libs.empty()) {
                 g_waiting_read_exit.insert(pid);
                 remember_pending_exit(pid, regs);
                 uint64_t pc = tracer_get_pc(regs);
@@ -1528,7 +1319,9 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
             }
 
             // Check /proc/self/status for TracerPid hiding
-            if (is_proc_status_path(path)) {
+            if (tracer_stealth::is_proc_status_path(path, g_target_pid,
+                                                    resolve_tgid_for_stealth,
+                                                    nullptr)) {
                 g_waiting_read_exit.insert(pid);
                 remember_pending_exit(pid, regs);
                 uint64_t pc = tracer_get_pc(regs);
@@ -1541,7 +1334,7 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
             // Interesting path but not maps/status — log normally
             uint64_t pc = tracer_get_pc(regs);
             std::string caller = resolve_caller_cached(pid, pc);
-            log_syscall(pid, syscall_name(nr), path.c_str(), caller.c_str());
+            log_syscall(pid, tracer_syscall_name(nr), path.c_str(), caller.c_str());
             g_stat_logged++;
             maybe_report_stats();
             return SECCOMP_ACT_CONTINUE;
@@ -1561,7 +1354,10 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
             // Recovery path: if openat-exit tracking missed this fd, detect maps/status
             // directly from /proc/<tid>/fd/<fd> and add it lazily.
             const std::string &fd_path = resolve_fd_cached(pid, fd_val);
-            if (is_proc_maps_path(fd_path) && !g_protected_libs.empty()) {
+            if (tracer_stealth::is_proc_maps_path(fd_path, g_target_pid,
+                                                  resolve_tgid_for_stealth,
+                                                  nullptr) &&
+                !g_protected_libs.empty()) {
                 g_maps_fds.insert(key);
                 auto it = g_maps_fd_states.find(key);
                 if (it == g_maps_fd_states.end()) {
@@ -1569,7 +1365,8 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
                     uint64_t age_ms = now_ms() - g_maps_stage_start_ms;
                     state.tamper_enabled = (key.tgid != g_target_pid) || (age_ms > 1500);
                     if (state.tamper_enabled) {
-                        build_sanitized_maps_snapshot(g_target_pid, state.sanitized_maps);
+                        tracer_stealth::build_sanitized_maps_snapshot(
+                            g_target_pid, g_protected_libs, state.sanitized_maps);
                     }
                     g_maps_fd_states[key] = std::move(state);
                 }
@@ -1578,7 +1375,9 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
                             "[maps_bypass] late-track maps fd: tid=%d tgid=%d fd=%llu path=%s\n",
                             pid, key.tgid, (unsigned long long)fd_val, fd_path.c_str());
                 }
-            } else if (is_proc_status_path(fd_path)) {
+            } else if (tracer_stealth::is_proc_status_path(fd_path, g_target_pid,
+                                                           resolve_tgid_for_stealth,
+                                                           nullptr)) {
                 g_status_fds.insert(key);
                 if (g_verbose_logs && g_log_fp) {
                     fprintf(g_log_fp,
@@ -1692,7 +1491,7 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
     } else {
         uint64_t path_addr = tracer_get_arg(regs, 1);
         std::string path = read_tracee_string(pid, path_addr);
-        log_syscall(pid, syscall_name(nr), path.c_str(), caller.c_str());
+        log_syscall(pid, tracer_syscall_name(nr), path.c_str(), caller.c_str());
     }
 
     g_stat_logged++;
@@ -1806,7 +1605,9 @@ void handle_syscall_exit(pid_t pid) {
                     // Do not patch here — SO is only opened, not loaded yet.
                 }
 
-                if (is_proc_maps_path(path_str)) {
+                if (tracer_stealth::is_proc_maps_path(path_str, g_target_pid,
+                                                      resolve_tgid_for_stealth,
+                                                      nullptr)) {
                     uint64_t fd_val = (uint64_t)ret;
                     tracked_fd_key key = make_fd_key(pid, fd_val);
                     g_maps_fds.insert(key);
@@ -1818,7 +1619,8 @@ void handle_syscall_exit(pid_t pid) {
                     uint64_t age_ms = now_ms() - g_maps_stage_start_ms;
                     state.tamper_enabled = (key.tgid != g_target_pid) || (age_ms > 1500);
                     if (state.tamper_enabled) {
-                        if (!build_sanitized_maps_snapshot(g_target_pid, state.sanitized_maps)) {
+                        if (!tracer_stealth::build_sanitized_maps_snapshot(
+                                g_target_pid, g_protected_libs, state.sanitized_maps)) {
                             LOGW(TAG "maps_bypass: failed to prebuild sanitized snapshot for pid %d",
                                  g_target_pid);
                         }
@@ -1836,7 +1638,9 @@ void handle_syscall_exit(pid_t pid) {
                                 g_maps_fd_states[key].tamper_enabled ? 1 : 0);
                         fflush(g_log_fp);
                     }
-                } else if (is_proc_status_path(path_str)) {
+                } else if (tracer_stealth::is_proc_status_path(path_str, g_target_pid,
+                                                               resolve_tgid_for_stealth,
+                                                               nullptr)) {
                     tracked_fd_key key = make_fd_key(pid, (uint64_t)ret);
                     g_status_fds.insert(key);
                     if (g_verbose_logs) {

@@ -30,6 +30,7 @@ static constexpr long kPtraceOptions =
         PTRACE_O_TRACESECCOMP |
         PTRACE_O_TRACECLONE |
         PTRACE_O_TRACEFORK |
+        PTRACE_O_TRACEVFORK |
         PTRACE_O_TRACESYSGOOD;
 
 // ---------------------------------------------------------------------------
@@ -225,8 +226,10 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
             continue;
         }
 
-        // New child from clone/fork — auto-traced via PTRACE_O_TRACECLONE
-        if (event == PTRACE_EVENT_CLONE || event == PTRACE_EVENT_FORK) {
+        // New child/thread from clone/fork/vfork.
+        if (event == PTRACE_EVENT_CLONE ||
+            event == PTRACE_EVENT_FORK ||
+            event == PTRACE_EVENT_VFORK) {
             unsigned long new_pid = 0;
             ptrace(PTRACE_GETEVENTMSG, stopped_pid, nullptr, &new_pid);
             LOGI(TAG "new child %lu from pid %d", new_pid, stopped_pid);
@@ -244,6 +247,11 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
                         LOGI(TAG "injected seccomp filter into new tid %lu", new_pid);
                     } else {
                         LOGW(TAG "failed to inject filter into new tid %lu", new_pid);
+                    }
+                    if (ptrace(PTRACE_SETOPTIONS, (pid_t)new_pid, nullptr,
+                               (void *)(uintptr_t)kPtraceOptions) < 0) {
+                        LOGW(TAG "failed to set ptrace options on new tid %lu: %s",
+                             new_pid, strerror(errno));
                     }
                     ptrace(PTRACE_CONT, (pid_t)new_pid, nullptr, nullptr);
                 } else {

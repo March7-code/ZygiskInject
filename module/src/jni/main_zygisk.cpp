@@ -16,9 +16,10 @@
 #include <cerrno>
 #include <cstring>
 
-#include "inject.h"
 #include "config.h"
 #include "log.h"
+#include "runtime/tracer_protocol.h"
+#include "runtime/zygisk_entry.h"
 #include "zygisk.h"
 
 #if defined(__aarch64__)
@@ -27,7 +28,6 @@
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
-using zygisk::ServerSpecializeArgs;
 
 static constexpr const char *MODULE_DIR  = "/data/adb/re.zyg.fri";
 static constexpr const char *FALLBACK_DIR = "/data/local/tmp/re.zyg.fri";
@@ -56,14 +56,6 @@ static bool write_u16(int fd, uint16_t value) {
 }
 
 static bool read_u16(int fd, uint16_t &value) {
-    return read(fd, &value, sizeof(value)) == sizeof(value);
-}
-
-static bool write_u8(int fd, uint8_t value) {
-    return write(fd, &value, sizeof(value)) == sizeof(value);
-}
-
-static bool read_u8(int fd, uint8_t &value) {
     return read(fd, &value, sizeof(value)) == sizeof(value);
 }
 
@@ -334,7 +326,8 @@ static std::string companion_copy_to_appdir(const std::string &src_path,
 //              -> send abstract unix socket name (empty = failure)
 //      - "off": no-op
 //   4. recv tracer_mode:
-//      - "probe": recv target_pid + log_path + tracer_verbose_logs -> launch tracer
+//      - "probe": recv target_pid + log_path + tracer_verbose_logs +
+//                 tracer_block_self_kill + so_load_patches -> launch tracer
 //      - others: no-op
 // ---------------------------------------------------------------------------
 
@@ -407,42 +400,18 @@ static void companion_handler(int client) {
 
     // Step 4: tracer launch request (arm64 only)
 #if defined(__aarch64__)
-    std::string tracer_mode;
-    if (read_string(client, tracer_mode) && tracer_mode == "probe") {
-        uint32_t target_pid = 0;
-        if (read(client, &target_pid, sizeof(target_pid)) == sizeof(target_pid)) {
-            std::string log_path;
-            read_string(client, log_path);
-            uint8_t tracer_verbose_logs = 0;
-            read_u8(client, tracer_verbose_logs);
-            uint8_t tracer_block_self_kill = 0;
-            read_u8(client, tracer_block_self_kill);
-
-            // Read SO hook configs
-            std::vector<so_hook_config> so_hooks;
-            uint32_t num_so_hooks = 0;
-            if (read(client, &num_so_hooks, sizeof(num_so_hooks)) == sizeof(num_so_hooks)) {
-                for (uint32_t i = 0; i < num_so_hooks; i++) {
-                    so_hook_config shc;
-                    read_string(client, shc.so_name);
-                    uint32_t num_hooks = 0;
-                    read(client, &num_hooks, sizeof(num_hooks));
-                    for (uint32_t j = 0; j < num_hooks; j++) {
-                        hook_point hp{};
-                        read(client, &hp.offset, sizeof(hp.offset));
-                        read(client, &hp.return_value, sizeof(hp.return_value));
-                        read(client, &hp.branch_to, sizeof(hp.branch_to));
-                        shc.hooks.push_back(hp);
-                    }
-                    so_hooks.push_back(std::move(shc));
-                }
-            }
-
-            LOGI("[companion] launching tracer for pid %u, log=%s, so_hooks=%zu",
-                 target_pid, log_path.c_str(), so_hooks.size());
-            launch_tracer((pid_t)target_pid, log_path, tracer_verbose_logs != 0,
-                          tracer_block_self_kill != 0, so_hooks);
-        }
+    runtime::tracer_launch_request tracer_req;
+    runtime::tracer_request_read_status tracer_status =
+        runtime::read_tracer_launch_request(client, &tracer_req);
+    if (tracer_status == runtime::tracer_request_read_status::kReady) {
+        LOGI("[companion] launching tracer for pid %u, log=%s, so_hooks=%zu",
+             tracer_req.target_pid, tracer_req.log_path.c_str(), tracer_req.so_hooks.size());
+        launch_tracer((pid_t)tracer_req.target_pid, tracer_req.log_path,
+                      tracer_req.verbose_logs,
+                      tracer_req.block_self_kill,
+                      tracer_req.so_hooks);
+    } else if (tracer_status == runtime::tracer_request_read_status::kMalformed) {
+        LOGW("[companion] malformed tracer request");
     }
 #endif
 }
@@ -456,238 +425,19 @@ REGISTER_ZYGISK_COMPANION(companion_handler)
 class MyModule : public zygisk::ModuleBase {
  public:
     void onLoad(Api *api, JNIEnv *env) override {
-        this->api = api;
-        this->env = env;
+        entry_.on_load(api, env);
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
-        const char *raw = env->GetStringUTFChars(args->nice_name, nullptr);
-        app_name = std::string(raw);
-        env->ReleaseStringUTFChars(args->nice_name, raw);
-        gadget_connect_override_address.clear();
-
-        int sock = api->connectCompanion();
-        if (sock < 0) {
-            LOGW("[module] connectCompanion failed");
-            return;
-        }
-
-        // Step 1: send app_name, receive JSON
-        if (!write_string(sock, app_name)) {
-            LOGW("[module] failed to send app_name");
-            close(sock);
-            return;
-        }
-
-        std::string json;
-        if (!read_string(sock, json) || json.empty()) {
-            close(sock);
-            return;
-        }
-        companion_json = json;
-        LOGI("[module] received config (%zu bytes)", json.size());
-
-        // Step 2: parse config to know which libs to prefetch
-        auto cfg = parse_advanced_config(companion_json, app_name);
-        if (!cfg.has_value()) {
-            write_string(sock, "");  // send sentinel
-            close(sock);
-            return;
-        }
-
-        bool gadget_connect_mode = (cfg->gadget_interaction == "connect");
-        if (!gadget_connect_mode && cfg->gadget_connect_use_unix_proxy) {
-            gadget_connect_mode = true;
-            LOGW("[module] gadget_connect_use_unix_proxy=true but interaction=%s; forcing connect mode",
-                 cfg->gadget_interaction.c_str());
-        }
-
-        // Request tmp file for each injected library
-        for (auto &lib_path : cfg->injected_libraries) {
-            if (!write_string(sock, lib_path)) break;
-
-            std::string tmp_path;
-            if (!read_string(sock, tmp_path) || tmp_path.empty()) {
-                LOGW("[module] companion failed to copy %s", lib_path.c_str());
-                continue;
-            }
-
-            LOGI("[module] tmp file ready: %s -> %s", lib_path.c_str(), tmp_path.c_str());
-            tmpfile_paths[lib_path] = tmp_path;
-        }
-
-        // Send empty sentinel to end lib copy session
-        write_string(sock, "");
-
-        // Step 3: optionally request a unix proxy for gadget connect mode.
-        // The proxy runs in companion (root) and bridges:
-        //   gadget unix socket <-> original tcp target (address:port).
-        if (gadget_connect_mode &&
-            cfg->gadget_connect_use_unix_proxy &&
-            cfg->gadget_connect_address.rfind("unix:", 0) != 0) {
-            if (!write_string(sock, "on") ||
-                !write_string(sock, cfg->gadget_connect_address) ||
-                !write_u16(sock, cfg->gadget_connect_port) ||
-                !write_string(sock, cfg->gadget_connect_unix_name)) {
-                LOGW("[module] failed to request unix proxy");
-            } else {
-                std::string unix_name;
-                if (read_string(sock, unix_name) && !unix_name.empty()) {
-                    gadget_connect_override_address = "unix:" + unix_name;
-                    LOGI("[module] unix proxy ready for gadget connect: %s",
-                         gadget_connect_override_address.c_str());
-                } else {
-                    LOGW("[module] unix proxy request failed, fallback to tcp connect");
-                }
-            }
-        } else {
-            if (gadget_connect_mode &&
-                cfg->gadget_connect_use_unix_proxy &&
-                cfg->gadget_connect_address.rfind("unix:", 0) == 0) {
-                LOGI("[module] connect address already unix, skip unix proxy bridge");
-            }
-            write_string(sock, "off");
-        }
-
-        // Step 4: request tracer launch if configured (arm64 only)
-        // The companion (root) will fork a tracer process that attaches
-        // to our pid via ptrace. We send the request here in preAppSpecialize
-        // because connectCompanion is only available at this stage.
-        // Auto-enable tracer if dobby_hooks are configured (needed for SO load-time patching).
-#if defined(__aarch64__)
-        bool need_tracer = (cfg->tracer_mode == "probe") || !cfg->dobby_hooks.empty();
-        if (need_tracer) {
-            write_string(sock, "probe");
-            uint32_t my_pid = (uint32_t)getpid();
-            ::write(sock, &my_pid, sizeof(my_pid));
-            write_string(sock, cfg->tracer_log_path);
-            write_u8(sock, cfg->tracer_verbose_logs ? 1 : 0);
-            write_u8(sock, cfg->tracer_block_self_kill ? 1 : 0);
-            // Send SO hook configs
-            uint32_t num_so_hooks = (uint32_t)cfg->dobby_hooks.size();
-            ::write(sock, &num_so_hooks, sizeof(num_so_hooks));
-            for (auto &shc : cfg->dobby_hooks) {
-                write_string(sock, shc.so_name);
-                uint32_t num_hooks = (uint32_t)shc.hooks.size();
-                ::write(sock, &num_hooks, sizeof(num_hooks));
-                for (auto &hp : shc.hooks) {
-                    ::write(sock, &hp.offset, sizeof(hp.offset));
-                    ::write(sock, &hp.return_value, sizeof(hp.return_value));
-                    ::write(sock, &hp.branch_to, sizeof(hp.branch_to));
-                }
-            }
-        } else {
-            write_string(sock, "off");
-        }
-#else
-        write_string(sock, "off");
-#endif
-
-        close(sock);
+        entry_.pre_app_specialize(args);
     }
 
     void postAppSpecialize(const AppSpecializeArgs *args) override {
-        if (app_name.empty()) {
-            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        std::optional<target_config> cfg;
-
-        if (!companion_json.empty()) {
-            cfg = parse_advanced_config(companion_json, app_name);
-        }
-        if (!cfg.has_value()) {
-            cfg = load_config(FALLBACK_DIR, app_name);
-        }
-        if (!cfg.has_value()) {
-            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        LOGI("App detected: %s", app_name.c_str());
-
-        if (!cfg->enabled) {
-            LOGI("Injection disabled for %s", app_name.c_str());
-            // Clean up any temp files
-            for (auto &kv : tmpfile_paths) unlink(kv.second.c_str());
-            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        // Replace lib paths with tmp file paths where available
-        for (auto &lib_path : cfg->injected_libraries) {
-            auto it = tmpfile_paths.find(lib_path);
-            if (it != tmpfile_paths.end()) {
-                LOGI("[module] using tmp path %s for %s",
-                     it->second.c_str(), lib_path.c_str());
-                lib_path = it->second;
-            }
-        }
-
-        // Write a .config.so next to each gadget tmp file so Frida picks up
-        // custom listen port / on_load behaviour.  The file must exist before
-        // dlopen, and we are already running as the app UID so we can write
-        // into our own data dir.
-        bool gadget_connect_mode = (cfg->gadget_interaction == "connect");
-        if (!gadget_connect_mode && cfg->gadget_connect_use_unix_proxy) {
-            gadget_connect_mode = true;
-        }
-
-        for (auto &lib_path : cfg->injected_libraries) {
-            if (lib_path.find("/.zyg_") == std::string::npos) continue;
-            // <name>.so  ->  <name>.config.so
-            std::string cfg_path = lib_path.substr(0, lib_path.size() - 3) + ".config.so";
-
-            // Build Frida gadget config JSON based on interaction type
-            std::string json;
-            if (gadget_connect_mode) {
-                std::string connect_address = cfg->gadget_connect_address;
-                if (!gadget_connect_override_address.empty()) {
-                    connect_address = gadget_connect_override_address;
-                }
-
-                json = "{\"interaction\":{\"type\":\"connect\"";
-                json += ",\"address\":\"" + connect_address + "\"";
-                if (connect_address.rfind("unix:", 0) != 0) {
-                    json += ",\"port\":" + std::to_string(cfg->gadget_connect_port);
-                }
-                json += ",\"on_load\":\"" + cfg->gadget_on_load + "\"";
-                json += "}}";
-            } else {
-                json = "{\"interaction\":{\"type\":\"listen\"";
-                if (cfg->gadget_listen_port > 0) {
-                    json += ",\"address\":\"127.0.0.1\"";
-                    json += ",\"port\":" + std::to_string(cfg->gadget_listen_port);
-                }
-                json += ",\"on_load\":\"" + cfg->gadget_on_load + "\"";
-                json += "}}";
-            }
-
-            int fd = open(cfg_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-            if (fd >= 0) {
-                write(fd, json.data(), json.size());
-                close(fd);
-                LOGI("[module] wrote gadget config %s: %s", cfg_path.c_str(), json.c_str());
-            } else {
-                LOGW("[module] failed to write gadget config %s: %s",
-                     cfg_path.c_str(), strerror(errno));
-            }
-        }
-
-        check_and_inject_with_config(cfg.value());
-
-        // tmp files are unlinked by inject_lib() after dlopen completes.
+        entry_.post_app_specialize(args);
     }
 
  private:
-    Api *api;
-    JNIEnv *env;
-    std::string app_name;
-    std::string companion_json;
-    std::string gadget_connect_override_address;
-    // original lib_path -> tmp file path in app's data dir
-    std::map<std::string, std::string> tmpfile_paths;
+    runtime::zygisk_entry entry_;
 };
 
 REGISTER_ZYGISK_MODULE(MyModule)
