@@ -11,4 +11,5 @@ local.properties
 /gadget/*
 !.gitkeep
 out
-.claude
+/.claude
+docs
