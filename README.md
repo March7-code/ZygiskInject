@@ -2,6 +2,10 @@
 
 基于 [lico-n/ZygiskFrida](https://github.com/lico-n/ZygiskFrida) 改进而来的增强版本，在原有 Zygisk 注入 Frida Gadget 的基础上，新增了 **Seccomp Tracer**（syscall 行为探测）和 **Ptrace 远程内存 Patch**（SO 加载时精准 patch）两大核心能力，形成一套「探测 → Patch → 调试」的完整反反调试工作流。
 
+### 已知问题：
+
+ptracer是双刃剑、既能很好地通过seccomap分析系统调用，但是又及其容易被检测，一时半会也想不到什么更好的办法去改。还在想办法捕捉更多检测行为、以及检测到了frida的哪些部分，来做反制，不知道之后能不能实现。
+
 ## 设计想法
 
 如果一定要用Frida的话，那么建议一定要试试这个模块。
@@ -81,7 +85,7 @@ seccomp BPF 过滤器在内核态对每个 syscall 做匹配，命中时返回 `
     "injected_libraries": [
       {"path": "/data/adb/re.zyg.fri/libgadget.so"}
     ],
-    "gadget_interaction": "listen",   // "listen" | "connect"
+    "gadget_interaction": "connect",   // "listen" | "connect"
     "gadget_on_load": "resume",       // "wait" | "resume"
     "gadget_listen_port": 0,
     "gadget_connect_address": "127.0.0.1",
@@ -105,8 +109,7 @@ seccomp BPF 过滤器在内核态对每个 syscall 做匹配，命中时返回 `
       {
         "so_name": "xxx.so",
         "hooks": [
-          {"offset": "0x163c10", "return_value": 0},
-          {"offset": "0x4d8bd8", "return_value": -1}
+          {"offset": "0x163c10", "return_value": 0}
         ]
       }
     ]
@@ -147,14 +150,6 @@ adb shell 'su -c "cat /data/local/tmp/re.zyg.fri/syscall_trace.log"'
 - [ ] 捕捉进程自毁时的堆栈，更快定位关键检测点
 - [ ] 完善行为分析 tracer，加入更多行为特征捕捉
 - [ ] 多架构支持（目前仅实现了 ARM64）
-
-## 关于 `so_load_patches` 命名
-
-配置字段已统一改为 `so_load_patches`，用于描述“目标 SO 加载阶段的远程 patch 点”，避免与早期进程内 Dobby inline hook 语义混淆。
-
-## 一堆史山：
-
-哪天心情好就去好好清理，以及tracer部分优化空间非常巨大，调试阶段启用、后续patch通过建议关闭，对运行性能会有一定影响，行为分析日志写得挺烂，不过成功了管他呢。
 
 ## Credits
 
