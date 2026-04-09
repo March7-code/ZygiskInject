@@ -51,9 +51,10 @@ tracer_request_read_status read_tracer_launch_request(int fd, tracer_launch_requ
         return tracer_request_read_status::kMalformed;
     }
 
-    if (tracer_mode != "probe") {
+    if (tracer_mode != "probe" && tracer_mode != "patch") {
         return tracer_request_read_status::kNone;
     }
+    req.mode = tracer_mode;
 
     if (!read_u32(fd, &req.target_pid) ||
         !read_string(fd, &req.log_path)) {

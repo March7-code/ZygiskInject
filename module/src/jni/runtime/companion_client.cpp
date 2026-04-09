@@ -59,10 +59,25 @@ bool write_bytes(int fd, const void *ptr, size_t len) {
 
 bool send_tracer_request(int sock, const target_config &cfg) {
 #if defined(__aarch64__)
-    bool need_tracer = (cfg.tracer_mode == "probe") || !cfg.so_load_patches.empty();
+    std::string launch_tracer_mode = "off";
+    if (cfg.tracer_mode == "probe") {
+        launch_tracer_mode = "probe";
+    } else if (cfg.tracer_mode == "patch" && !cfg.so_load_patches.empty()) {
+        launch_tracer_mode = "patch";
+    } else if (!cfg.so_load_patches.empty()) {
+        // Preserve existing behavior unless config explicitly opts into
+        // patch-only mode.
+        launch_tracer_mode = "probe";
+    }
+
+    bool need_tracer = (launch_tracer_mode != "off");
+    LOGI("[module] tracer launch decision: tracer_mode=%s request=%s so_hooks=%zu block_self_kill=%d",
+         cfg.tracer_mode.c_str(), launch_tracer_mode.c_str(),
+         cfg.so_load_patches.size(), cfg.tracer_block_self_kill ? 1 : 0);
     if (need_tracer) {
-        if (!write_string(sock, "probe")) {
-            LOGW("[module] send_tracer_request: failed to write mode=probe");
+        if (!write_string(sock, launch_tracer_mode)) {
+            LOGW("[module] send_tracer_request: failed to write mode=%s",
+                 launch_tracer_mode.c_str());
             return false;
         }
         uint32_t my_pid = static_cast<uint32_t>(getpid());

@@ -55,7 +55,11 @@ struct target_config{
     std::string gadget_on_load = "resume";
 
     // Anti-cheat detection tracer settings.
-    // tracer_mode: "off" (default), "probe" (log only), "block" (phase-2 hook).
+    // tracer_mode:
+    //   "off"   (default): no tracer
+    //   "probe"          : seccomp + ptrace tracing for logging/tampering features
+    //   "patch"          : ptrace syscall tracing for so_load_patches only
+    //   "block"          : compatibility alias for "probe"
     // tracer_log_path: log file for probe mode.
     // tracer_verbose_logs: when true, emit detailed per-read debug logs.
     std::string tracer_mode = "off";

@@ -37,8 +37,11 @@ static std::string normalize_tracer_mode(const std::string &raw_mode) {
         return "off";
     }
     if (mode == "probe" || mode == "block") {
-        // Current wire protocol recognizes "probe"; keep "block" as compatibility alias.
+        // Keep "block" as a compatibility alias for the probe pipeline.
         return "probe";
+    }
+    if (mode == "patch") {
+        return "patch";
     }
     LOGW("unknown tracer_mode '%s', fallback to 'off'", raw_mode.c_str());
     return "off";

@@ -1499,6 +1499,79 @@ seccomp_action handle_seccomp_stop(pid_t pid) {
     return SECCOMP_ACT_CONTINUE;
 }
 
+void handle_patch_syscall_entry(pid_t pid) {
+    if (g_all_so_hooks_done || g_so_hooks.empty()) return;
+    if (resolve_tracee_tgid(pid) != g_target_pid) return;
+
+    tracer_regs regs;
+    if (!tracer_getregs(pid, regs)) {
+        LOGE(TAG "GETREGSET failed for patch entry pid %d: %s", pid, strerror(errno));
+        return;
+    }
+
+    uint64_t nr = tracer_get_syscall_nr(regs);
+
+    if (nr == __NR_openat) {
+        uint64_t path_addr = tracer_get_arg(regs, 1);
+        std::string path = read_tracee_string(pid, path_addr);
+        std::string basename = normalize_path_basename(path);
+        for (size_t i = 0; i < g_so_hooks.size(); i++) {
+            if (!g_so_hooks[i].done && g_so_hooks[i].so_name == basename) {
+                LOGI(TAG "so_hook: patch-only intercepted openat(%s)", path.c_str());
+                remember_pending_exit(pid, regs);
+                return;
+            }
+        }
+        return;
+    }
+
+#ifdef __NR_mmap
+    if (nr == __NR_mmap) {
+        uint64_t fd_val = tracer_get_arg(regs, 4);
+        if (fd_val == (uint64_t)-1) return;
+
+        size_t idx = 0;
+        if (lookup_so_hook_idx_by_fd(pid, fd_val, &idx)) {
+            remember_pending_exit(pid, regs);
+            return;
+        }
+
+        const std::string &fd_path = resolve_fd_cached(pid, fd_val);
+        if (match_pending_so_hook_by_path(fd_path, &idx)) {
+            tracked_fd_key key = make_fd_key(pid, fd_val);
+            g_so_hook_fds[key] = idx;
+            g_so_hook_fds_raw[fd_val] = idx;
+            LOGI(TAG "so_hook: patch-only mmap(fd=%llu) resolved via fd-path=%s -> idx=%zu",
+                 (unsigned long long)fd_val, fd_path.c_str(), idx);
+            remember_pending_exit(pid, regs);
+        }
+        return;
+    }
+#endif
+
+#ifdef __NR_mprotect
+    if (nr == __NR_mprotect) {
+        remember_pending_exit(pid, regs);
+        return;
+    }
+#endif
+
+    if (nr == __NR_close) {
+        uint64_t fd_val = tracer_get_arg(regs, 0);
+        if (lookup_so_hook_idx_by_fd(pid, fd_val, nullptr)) {
+            remember_pending_exit(pid, regs);
+        }
+    }
+}
+
+bool syscall_handler_has_pending_exit(pid_t pid) {
+    return g_pending_exit.find(pid) != g_pending_exit.end();
+}
+
+bool syscall_handler_patch_only_done() {
+    return !g_so_hooks.empty() && g_all_so_hooks_done;
+}
+
 void handle_syscall_exit(pid_t pid) {
     pending_exit_state pending{};
     bool have_pending = false;

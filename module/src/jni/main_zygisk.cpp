@@ -328,6 +328,7 @@ static std::string companion_copy_to_appdir(const std::string &src_path,
 //   4. recv tracer_mode:
 //      - "probe": recv target_pid + log_path + tracer_verbose_logs +
 //                 tracer_block_self_kill + so_load_patches -> launch tracer
+//      - "patch": same payload, but launch ptrace-only patch tracer
 //      - others: no-op
 // ---------------------------------------------------------------------------
 
@@ -404,12 +405,16 @@ static void companion_handler(int client) {
     runtime::tracer_request_read_status tracer_status =
         runtime::read_tracer_launch_request(client, &tracer_req);
     if (tracer_status == runtime::tracer_request_read_status::kReady) {
-        LOGI("[companion] launching tracer for pid %u, log=%s, so_hooks=%zu",
-             tracer_req.target_pid, tracer_req.log_path.c_str(), tracer_req.so_hooks.size());
+        LOGI("[companion] launching tracer mode=%s for pid %u, log=%s, so_hooks=%zu",
+             tracer_req.mode.c_str(), tracer_req.target_pid,
+             tracer_req.log_path.c_str(), tracer_req.so_hooks.size());
         launch_tracer((pid_t)tracer_req.target_pid, tracer_req.log_path,
                       tracer_req.verbose_logs,
                       tracer_req.block_self_kill,
-                      tracer_req.so_hooks);
+                      tracer_req.so_hooks,
+                      tracer_req.mode == "patch"
+                          ? tracer_runtime_mode::patch_only
+                          : tracer_runtime_mode::seccomp_probe);
     } else if (tracer_status == runtime::tracer_request_read_status::kMalformed) {
         LOGW("[companion] malformed tracer request");
     }

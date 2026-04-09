@@ -26,12 +26,14 @@ static std::set<pid_t> g_filter_injected;
 static bool g_tsync_ok = false;
 // Cached BPF program for injecting into new threads
 static seccomp_bpf_program g_bpf;
-static constexpr long kPtraceOptions =
-        PTRACE_O_TRACESECCOMP |
+static constexpr long kPtraceBaseOptions =
         PTRACE_O_TRACECLONE |
         PTRACE_O_TRACEFORK |
         PTRACE_O_TRACEVFORK |
         PTRACE_O_TRACESYSGOOD;
+static constexpr long kPtraceSeccompOptions =
+        kPtraceBaseOptions |
+        PTRACE_O_TRACESECCOMP;
 
 // ---------------------------------------------------------------------------
 // PTRACE_SEIZE existing threads so seccomp TRACE events are delivered to tracer.
@@ -52,7 +54,9 @@ static constexpr long kPtraceOptions =
 //
 // Returns the set of tids that were frozen (caller must PTRACE_CONT them).
 // ---------------------------------------------------------------------------
-static std::set<pid_t> freeze_all_threads(pid_t target_pid) {
+static std::set<pid_t> freeze_all_threads(pid_t target_pid,
+                                          long ptrace_options,
+                                          bool mark_filter_injected) {
     std::set<pid_t> frozen;
     char task_dir[64];
     snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", target_pid);
@@ -74,7 +78,7 @@ static std::set<pid_t> freeze_all_threads(pid_t target_pid) {
 
             // Seize
             long r = ptrace(PTRACE_SEIZE, tid, nullptr,
-                            (void *)(uintptr_t)kPtraceOptions);
+                            (void *)(uintptr_t)ptrace_options);
             if (r < 0) {
                 LOGW(TAG "freeze_all_threads: SEIZE tid %d failed: %s", tid, strerror(errno));
                 continue;
@@ -91,7 +95,9 @@ static std::set<pid_t> freeze_all_threads(pid_t target_pid) {
             pid_t wp = waitpid(tid, &st, __WALL);
             if (wp == tid && WIFSTOPPED(st)) {
                 frozen.insert(tid);
-                g_filter_injected.insert(tid);
+                if (mark_filter_injected) {
+                    g_filter_injected.insert(tid);
+                }
                 new_count++;
             } else {
                 LOGW(TAG "freeze_all_threads: waitpid tid %d returned wp=%d status=0x%x",
@@ -110,9 +116,9 @@ static std::set<pid_t> freeze_all_threads(pid_t target_pid) {
 }
 
 // Resume all previously frozen threads.
-static void resume_frozen_threads(const std::set<pid_t> &frozen) {
+static void resume_frozen_threads(const std::set<pid_t> &frozen, int ptrace_request) {
     for (pid_t tid : frozen) {
-        ptrace(PTRACE_CONT, tid, nullptr, nullptr);
+        ptrace(ptrace_request, tid, nullptr, nullptr);
     }
     LOGI(TAG "resumed %zu frozen threads", frozen.size());
 }
@@ -121,15 +127,15 @@ static void resume_frozen_threads(const std::set<pid_t> &frozen) {
 // Tracer process main logic (runs as root in a forked child)
 // ---------------------------------------------------------------------------
 
-static void tracer_process(pid_t target_pid, const std::string &log_path, bool verbose_logs,
-                           bool block_self_kill,
-                           const std::vector<so_hook_config> &so_hooks) {
+static void tracer_process_seccomp(pid_t target_pid, const std::string &log_path,
+                                   bool verbose_logs, bool block_self_kill,
+                                   const std::vector<so_hook_config> &so_hooks) {
     LOGI(TAG "tracer started, target pid=%d, log=%s",
          target_pid, log_path.c_str());
 
     // 1. PTRACE_SEIZE — non-stop attach, no SIGSTOP sent to target
     long ret = ptrace(PTRACE_SEIZE, target_pid, nullptr,
-                      (void*)(uintptr_t)kPtraceOptions);
+                      (void*)(uintptr_t)kPtraceSeccompOptions);
     if (ret < 0) {
         LOGE(TAG "PTRACE_SEIZE failed: %s", strerror(errno));
         _exit(1);
@@ -153,7 +159,7 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
     // 2b. "Stop the world": seize + freeze ALL sibling threads.
     // Every thread is stopped before the filter is installed, so no thread
     // can escape with SECCOMP_RET_TRACE but without a ptrace tracer.
-    std::set<pid_t> frozen = freeze_all_threads(target_pid);
+    std::set<pid_t> frozen = freeze_all_threads(target_pid, kPtraceSeccompOptions, true);
 
     // 3. Build and inject seccomp filter
     g_bpf = build_default_io_filter(block_self_kill);
@@ -171,7 +177,7 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
     syscall_handler_init(target_pid, log_path, verbose_logs, block_self_kill, so_hooks);
 
     // 5. Resume all frozen siblings, then the leader
-    resume_frozen_threads(frozen);
+    resume_frozen_threads(frozen, PTRACE_CONT);
 
     if (ptrace(PTRACE_CONT, target_pid, nullptr, nullptr) < 0) {
         LOGE(TAG "PTRACE_CONT after inject failed: %s", strerror(errno));
@@ -249,7 +255,7 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
                         LOGW(TAG "failed to inject filter into new tid %lu", new_pid);
                     }
                     if (ptrace(PTRACE_SETOPTIONS, (pid_t)new_pid, nullptr,
-                               (void *)(uintptr_t)kPtraceOptions) < 0) {
+                               (void *)(uintptr_t)kPtraceSeccompOptions) < 0) {
                         LOGW(TAG "failed to set ptrace options on new tid %lu: %s",
                              new_pid, strerror(errno));
                     }
@@ -289,13 +295,143 @@ static void tracer_process(pid_t target_pid, const std::string &log_path, bool v
     _exit(0);
 }
 
+static void tracer_process_patch_only(pid_t target_pid,
+                                      const std::vector<so_hook_config> &so_hooks) {
+    LOGI(TAG "patch-only tracer started, target pid=%d, so_hooks=%zu",
+         target_pid, so_hooks.size());
+
+    long ret = ptrace(PTRACE_SEIZE, target_pid, nullptr,
+                      (void *)(uintptr_t)kPtraceBaseOptions);
+    if (ret < 0) {
+        LOGE(TAG "PTRACE_SEIZE failed: %s", strerror(errno));
+        _exit(1);
+    }
+    LOGI(TAG "PTRACE_SEIZE succeeded (patch-only)");
+
+    if (ptrace(PTRACE_INTERRUPT, target_pid, nullptr, nullptr) < 0) {
+        LOGE(TAG "PTRACE_INTERRUPT failed: %s", strerror(errno));
+        _exit(1);
+    }
+
+    int status = 0;
+    waitpid(target_pid, &status, 0);
+
+    if (!WIFSTOPPED(status)) {
+        LOGE(TAG "target not stopped after INTERRUPT: status=0x%x", status);
+        _exit(1);
+    }
+
+    std::set<pid_t> frozen = freeze_all_threads(target_pid, kPtraceBaseOptions, false);
+    syscall_handler_init(target_pid, "", false, false, so_hooks);
+
+    resume_frozen_threads(frozen, PTRACE_SYSCALL);
+
+    if (ptrace(PTRACE_SYSCALL, target_pid, nullptr, nullptr) < 0) {
+        LOGE(TAG "PTRACE_SYSCALL start failed: %s", strerror(errno));
+        _exit(1);
+    }
+
+    LOGI(TAG "entering patch-only syscall tracing loop");
+
+    for (;;) {
+        pid_t stopped_pid = waitpid(-1, &status, __WALL);
+        if (stopped_pid < 0) {
+            if (errno == ECHILD) {
+                LOGI(TAG "no more children, exiting patch-only tracer");
+                break;
+            }
+            if (errno == EINTR) continue;
+            LOGE(TAG "waitpid error: %s", strerror(errno));
+            break;
+        }
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            g_awaiting_exit.erase(stopped_pid);
+            if (stopped_pid == target_pid) {
+                LOGI(TAG "target process exited before patch-only tracer finished");
+                break;
+            }
+            continue;
+        }
+
+        if (!WIFSTOPPED(status)) continue;
+
+        int sig = WSTOPSIG(status);
+        int event = (status >> 16) & 0xFF;
+
+        if (event == PTRACE_EVENT_CLONE ||
+            event == PTRACE_EVENT_FORK ||
+            event == PTRACE_EVENT_VFORK) {
+            unsigned long new_pid = 0;
+            ptrace(PTRACE_GETEVENTMSG, stopped_pid, nullptr, &new_pid);
+            LOGI(TAG "patch-only: new child %lu from pid %d", new_pid, stopped_pid);
+
+            if (new_pid > 0) {
+                int child_status = 0;
+                pid_t wp = waitpid((pid_t)new_pid, &child_status, __WALL);
+                if (wp == (pid_t)new_pid && WIFSTOPPED(child_status)) {
+                    if (ptrace(PTRACE_SETOPTIONS, (pid_t)new_pid, nullptr,
+                               (void *)(uintptr_t)kPtraceBaseOptions) < 0) {
+                        LOGW(TAG "patch-only: failed to set ptrace options on new tid %lu: %s",
+                             new_pid, strerror(errno));
+                    }
+                    ptrace(PTRACE_SYSCALL, (pid_t)new_pid, nullptr, nullptr);
+                } else {
+                    LOGW(TAG "patch-only: waitpid for new tid %lu returned wp=%d status=0x%x",
+                         new_pid, wp, child_status);
+                }
+            }
+
+            ptrace(PTRACE_SYSCALL, stopped_pid, nullptr, nullptr);
+            continue;
+        }
+
+        // Some kernels/devices report PTRACE_SYSCALL stops as plain SIGTRAP
+        // even when PTRACE_O_TRACESYSGOOD is enabled. Accept both forms so
+        // patch-only mode matches the more tolerant seccomp path.
+        if (sig == (SIGTRAP | 0x80) || (sig == SIGTRAP && event == 0)) {
+            if (g_awaiting_exit.count(stopped_pid)) {
+                if (syscall_handler_has_pending_exit(stopped_pid)) {
+                    handle_syscall_exit(stopped_pid);
+                    if (syscall_handler_patch_only_done()) {
+                        LOGI(TAG "patch-only hooks complete, stopping tracer");
+                        break;
+                    }
+                }
+                g_awaiting_exit.erase(stopped_pid);
+            } else {
+                handle_patch_syscall_entry(stopped_pid);
+                g_awaiting_exit.insert(stopped_pid);
+            }
+
+            if (ptrace(PTRACE_SYSCALL, stopped_pid, nullptr, nullptr) < 0) {
+                LOGE(TAG "patch-only: PTRACE_SYSCALL resume failed for pid %d: %s",
+                     stopped_pid, strerror(errno));
+                break;
+            }
+            continue;
+        }
+
+        int inject_sig = 0;
+        if (sig != SIGTRAP && sig != (SIGTRAP | 0x80)) {
+            inject_sig = sig;
+        }
+        ptrace(PTRACE_SYSCALL, stopped_pid, nullptr, (void *)(uintptr_t)inject_sig);
+    }
+
+    syscall_handler_fini();
+    LOGI(TAG "patch-only tracer exiting");
+    _exit(0);
+}
+
 // ---------------------------------------------------------------------------
 // Public API: fork a tracer child process
 // ---------------------------------------------------------------------------
 
 pid_t launch_tracer(pid_t target_pid, const std::string &log_path, bool verbose_logs,
                     bool block_self_kill,
-                    const std::vector<so_hook_config> &so_hooks) {
+                    const std::vector<so_hook_config> &so_hooks,
+                    tracer_runtime_mode mode) {
     pid_t child = fork();
     if (child < 0) {
         LOGE(TAG "fork failed: %s", strerror(errno));
@@ -304,7 +440,12 @@ pid_t launch_tracer(pid_t target_pid, const std::string &log_path, bool verbose_
     if (child == 0) {
         // In tracer child — detach from parent's session
         setsid();
-        tracer_process(target_pid, log_path, verbose_logs, block_self_kill, so_hooks);
+        if (mode == tracer_runtime_mode::patch_only) {
+            tracer_process_patch_only(target_pid, so_hooks);
+        } else {
+            tracer_process_seccomp(target_pid, log_path, verbose_logs,
+                                   block_self_kill, so_hooks);
+        }
         _exit(0);  // unreachable
     }
     LOGI(TAG "launched tracer pid=%d for target pid=%d", child, target_pid);

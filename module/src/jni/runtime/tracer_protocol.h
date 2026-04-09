@@ -16,6 +16,7 @@ enum class tracer_request_read_status {
 };
 
 struct tracer_launch_request {
+    std::string mode;
     uint32_t target_pid = 0;
     std::string log_path;
     bool verbose_logs = false;
@@ -24,9 +25,9 @@ struct tracer_launch_request {
 };
 
 // Decode step-4 tracer request from companion protocol socket.
-// Wire format is unchanged:
+// Wire format:
 //   tracer_mode(string)
-//   if mode == "probe":
+//   if mode == "probe" or "patch":
 //      target_pid(u32)
 //      log_path(string)
 //      tracer_verbose_logs(u8)

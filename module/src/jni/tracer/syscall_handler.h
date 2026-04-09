@@ -24,6 +24,16 @@ void syscall_handler_init(pid_t target_pid, const std::string &log_path, bool ve
 // and call handle_syscall_exit() on the next stop.
 seccomp_action handle_seccomp_stop(pid_t pid);
 
+// Handle a PTRACE_SYSCALL syscall-entry stop for patch-only mode.
+// Stores exit context for interesting syscalls used by SO load-time patching.
+void handle_patch_syscall_entry(pid_t pid);
+
+// True when handle_patch_syscall_entry() recorded an exit state for this tid.
+bool syscall_handler_has_pending_exit(pid_t pid);
+
+// True when all configured SO hooks have been patched successfully.
+bool syscall_handler_patch_only_done();
+
 // Handle syscall-exit stop for read() on a tracked fd.
 // Called after PTRACE_SYSCALL delivers the exit stop.
 void handle_syscall_exit(pid_t pid);

@@ -101,7 +101,7 @@ seccomp BPF 过滤器在内核态对每个 syscall 做匹配，命中时返回 `
     },
 
     // --- Seccomp Tracer（阶段一） ---
-    "tracer_mode": "off",             // "off" | "probe"
+    "tracer_mode": "off",             // "off" | "probe" | "patch"
     "tracer_log_path": "/data/local/tmp/re.zyg.fri/syscall_trace.log",
     "tracer_verbose_logs": false,
     "tracer_block_self_kill": false,
